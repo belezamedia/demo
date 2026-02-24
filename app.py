@@ -1,5 +1,5 @@
 # app.py
-# beleza ai chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
+# [ Your ] Ai Chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
 # ✅ Auto-deletes user data via TTL + idle timeout + janitor sweep (no cron needed)
 
 import os
@@ -61,7 +61,7 @@ if missing:
 # ============================
 # CONFIG
 # ============================
-APP_TITLE = "[Your] AI Chatbot"
+APP_TITLE = "[ Your ] Ai Chatbot"
 BRAND_PINK = "#FE5F9A"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
@@ -467,7 +467,7 @@ def main():
     touch_activity()
 
     # Header
-    st.markdown('<div class="gothic-title">beleza ai chatbot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gothic-title">[ Your ] Ai Chatbot</div>', unsafe_allow_html=True)
     st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
 
     # Upload step

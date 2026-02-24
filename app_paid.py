@@ -1,5 +1,5 @@
 # app.py
-# beleza ai chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
+# [ Your ] Ai Chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
 # ✅ Login screen (username + password) ALWAYS appears first (even on localhost)
 # ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
 # ✅ Auto-deletes user data via TTL + idle timeout + janitor sweep
@@ -64,7 +64,7 @@ if missing:
 # ============================
 # CONFIG
 # ============================
-APP_TITLE = "[Your] AI Chatbot"
+APP_TITLE = "[ Your ] Ai Chatbot"
 BRAND_PINK = "#FE5F9A"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
@@ -218,12 +218,12 @@ def login_gate() -> None:
         return
 
     if not (APP_USERNAME and APP_PASSWORD):
-        st.markdown('<div class="gothic-title">beleza ai chatbot</div>', unsafe_allow_html=True)
+        st.markdown('<div class="gothic-title">[ Your ] Ai Chatbot</div>', unsafe_allow_html=True)
         st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
         st.error("Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud).")
         st.stop()
 
-    st.markdown('<div class="gothic-title">beleza ai chatbot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gothic-title">[ Your ] Ai Chatbot</div>', unsafe_allow_html=True)
     st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
     st.markdown('<div class="gothic-sub">login</div>', unsafe_allow_html=True)
 
@@ -574,7 +574,7 @@ def main():
 
     touch_activity(workspace_id)
 
-    st.markdown('<div class="gothic-title">beleza ai chatbot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gothic-title">[ Your ] Ai Chatbot</div>', unsafe_allow_html=True)
     st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
 
     if not st.session_state.indexed:
