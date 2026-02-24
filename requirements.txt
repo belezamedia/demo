@@ -82,7 +82,9 @@ pypdf==6.7.0
 PyPika==0.51.1
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0
+python-docx>=1.1.0
 python-dotenv==1.2.1
+python-pptx>=1.0.2
 pytz==2025.2
 PyYAML==6.0.3
 referencing==0.37.0
@@ -96,6 +98,7 @@ shellingham==1.5.4
 six==1.17.0
 smmap==5.0.2
 streamlit==1.54.0
+striprtf>=0.0.27
 sympy==1.14.0
 tenacity==9.1.4
 tokenizers==0.22.2
