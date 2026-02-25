@@ -1,4 +1,4 @@
-# app.py
+# app_PAID_DEV.py
 # [ Your ] Ai Chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
 # ✅ Login screen (username + password) ALWAYS appears first (even on localhost)
 # ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
