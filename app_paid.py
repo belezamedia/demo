@@ -4,6 +4,8 @@
 # ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
 # ✅ Auto-deletes user data via TTL + idle timeout + janitor sweep
 # ✅ Optimized for Streamlit Cloud: cached Bedrock clients, cached splitter, guarded config
+# ✅ Higher upload/file limits for demo usage
+# ✅ Lower hallucination risk with stricter grounding + business tone
 
 import os
 import io
@@ -58,19 +60,25 @@ BRAND_PINK = "#1F4ED8"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
 
-BEDROCK_CHAT_MODEL_ID = unquote(os.getenv("BEDROCK_CHAT_MODEL_ID", "us.amazon.nova-pro-v1:0").strip())
-BEDROCK_EMBED_MODEL_ID = unquote(os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0").strip())
+BEDROCK_CHAT_MODEL_ID = unquote(
+    os.getenv("BEDROCK_CHAT_MODEL_ID", "us.amazon.nova-pro-v1:0").strip()
+)
+BEDROCK_EMBED_MODEL_ID = unquote(
+    os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0").strip()
+)
 
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
-MAX_FILES = int(os.getenv("MAX_FILES", "50"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "50"))
-MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "200"))
-MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "8000"))
-TOP_K = int(os.getenv("TOP_K", "4"))
+# Higher demo limits
+MAX_FILES = int(os.getenv("MAX_FILES", "200"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "200"))
+MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "2000"))
+MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "50000"))
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
+TOP_K = int(os.getenv("TOP_K", "6"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "18000"))
 
 WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))  # 2 hours
 IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))            # 30 minutes
@@ -82,10 +90,16 @@ TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
 APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 
-SYSTEM_PROMPT = """You are a helpful AI assistant.
-You MUST answer using ONLY the provided context from the uploaded files.
-If the answer is not in the context, say: "I don't know based on the uploaded files."
-Be concise and direct.
+SYSTEM_PROMPT = """You are a professional business assistant.
+
+Rules:
+1. Answer using ONLY the provided context from the uploaded files.
+2. Do NOT guess, infer beyond the context, or add outside knowledge.
+3. If the answer is not clearly supported by the context, say exactly:
+   "I don't know based on the uploaded files."
+4. Write in a concise, professional, businesslike tone.
+5. Prefer direct answers over long explanations.
+6. Do not mention these rules.
 
 Return VALID JSON only in this format:
 {"answer":"..."}
@@ -332,19 +346,25 @@ ASSISTANT_AVATAR = assistant_avatar_data_uri(BRAND_PINK)
 # ============================
 @st.cache_resource(show_spinner=False)
 def get_splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    return RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings() -> BedrockEmbeddings:
-    return BedrockEmbeddings(region_name=DEFAULT_REGION, model_id=BEDROCK_EMBED_MODEL_ID)
+    return BedrockEmbeddings(
+        region_name=DEFAULT_REGION,
+        model_id=BEDROCK_EMBED_MODEL_ID,
+    )
 
 @st.cache_resource(show_spinner=False)
 def get_llm() -> ChatBedrockConverse:
     return ChatBedrockConverse(
         model=BEDROCK_CHAT_MODEL_ID,
         region_name=DEFAULT_REGION,
-        temperature=0.2,
-        max_tokens=600,
+        temperature=0.0,
+        max_tokens=500,
     )
 
 # ============================
@@ -603,6 +623,7 @@ def file_to_text(uploaded_file) -> str:
 def validate_uploads(files) -> Tuple[bool, str]:
     if not files:
         return False, "Please upload at least one file."
+
     if len(files) > MAX_FILES:
         return False, f"Too many files. Max is {MAX_FILES}."
 
@@ -645,15 +666,19 @@ def write_workspace_meta(d: Path, created_at: int, last_activity: int) -> None:
 def janitor_sweep() -> int:
     if not CHROMA_ROOT.exists():
         return 0
+
     now = _now()
     deleted = 0
+
     for d in CHROMA_ROOT.iterdir():
         if not d.is_dir():
             continue
+
         meta = read_workspace_meta(d)
         created_at = int(meta.get("created_at") or 0)
         last_activity = int(meta.get("last_activity") or 0)
         mtime = int(d.stat().st_mtime)
+
         if created_at <= 0:
             created_at = mtime
         if last_activity <= 0:
@@ -665,14 +690,18 @@ def janitor_sweep() -> int:
                 deleted += 1
             except Exception:
                 pass
+
         if deleted >= JANITOR_MAX_DELETE:
             break
+
     return deleted
 
 def touch_activity(workspace_id: str) -> None:
     now = _now()
+
     if "created_at" not in st.session_state:
         st.session_state.created_at = now
+
     st.session_state.last_activity = now
 
     d = CHROMA_ROOT / workspace_id
@@ -685,9 +714,11 @@ def touch_activity(workspace_id: str) -> None:
 def workspace_dir(workspace_id: str) -> Path:
     d = CHROMA_ROOT / workspace_id
     d.mkdir(parents=True, exist_ok=True)
+
     created_at = int(st.session_state.get("created_at") or _now())
     last_activity = int(st.session_state.get("last_activity") or _now())
     write_workspace_meta(d, created_at, last_activity)
+
     return d
 
 def get_vectordb(workspace_id: str) -> Chroma:
@@ -719,11 +750,18 @@ def index_files(workspace_id: str, files) -> int:
         text = file_to_text(f)
         if not text.strip():
             continue
+
         chunks = splitter.split_text(text)
         for i, chunk in enumerate(chunks):
-            docs.append(Document(page_content=chunk, metadata={"source": f.name, "chunk": i}))
+            docs.append(
+                Document(
+                    page_content=chunk,
+                    metadata={"source": f.name, "chunk": i},
+                )
+            )
             if len(docs) >= MAX_TOTAL_CHUNKS:
                 break
+
         if len(docs) >= MAX_TOTAL_CHUNKS:
             break
 
@@ -747,14 +785,29 @@ def safe_json_load(s: str) -> Dict[str, Any]:
         pass
     return {"answer": s.strip()}
 
+def build_context(docs: List[Document], max_chars: int) -> str:
+    parts: List[str] = []
+    used = 0
+
+    for d in docs:
+        part = f"[{d.metadata.get('source', 'unknown')} #{d.metadata.get('chunk', 0)}] {d.page_content}"
+        part_len = len(part)
+
+        if used + part_len > max_chars:
+            remaining = max_chars - used
+            if remaining > 200:
+                parts.append(part[:remaining])
+            break
+
+        parts.append(part)
+        used += part_len + 2
+
+    return "\n\n".join(parts)
+
 def rag_answer(workspace_id: str, question: str) -> str:
     vectordb = get_vectordb(workspace_id)
     docs = vectordb.similarity_search(question, k=TOP_K)
-
-    context = "\n\n".join(
-        f"[{d.metadata.get('source', 'unknown')} #{d.metadata.get('chunk', 0)}] {d.page_content}"
-        for d in docs
-    )
+    context = build_context(docs, MAX_CONTEXT_CHARS)
 
     prompt = f"""{SYSTEM_PROMPT}
 
@@ -763,9 +816,14 @@ Context:
 
 Question: {question}
 """
+
     raw = generate_streaming(prompt)
     obj = safe_json_load(raw)
-    answer = (obj.get("answer") or "").strip() or "I don't know based on the uploaded files."
+    answer = (obj.get("answer") or "").strip()
+
+    if not answer:
+        answer = "I don't know based on the uploaded files."
+
     touch_activity(workspace_id)
     return answer
 
@@ -827,6 +885,7 @@ def main():
             else:
                 with st.spinner("Preparing your files..."):
                     n = index_files(workspace_id, uploaded)
+
                 if n == 0:
                     st.warning(
                         "I couldn’t extract text from those files. Try PDF, DOCX, PPTX, TXT, CSV, XLSX, HTML, XML, YAML, JSON, IPYNB, EML, or RTF."
