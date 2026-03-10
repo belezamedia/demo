@@ -6,6 +6,7 @@
 # ✅ Optimized for Streamlit Cloud: cached Bedrock clients, cached splitter, guarded config
 # ✅ Higher upload/file limits for demo usage
 # ✅ Lower hallucination risk with stricter grounding + business tone
+# ✅ Added support for ODT/ODS/ODP, DOC/PPT, MSG, XLSB, Parquet, NDJSON/JSONL, TS, RST, TEX
 
 import os
 import io
@@ -17,6 +18,7 @@ import shutil
 import hmac
 import hashlib
 import configparser
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import unquote, quote
@@ -46,11 +48,21 @@ from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_aws import ChatBedrockConverse, BedrockEmbeddings
 
-# Optional RTF parser
+# Optional parsers
 try:
     from striprtf.striprtf import rtf_to_text as _rtf_to_text
 except Exception:
     _rtf_to_text = None
+
+try:
+    import extract_msg  # .msg
+except Exception:
+    extract_msg = None
+
+try:
+    import olefile  # .doc / .ppt / .msg fallback
+except Exception:
+    olefile = None
 
 # ============================
 # CONFIG
@@ -70,9 +82,9 @@ BEDROCK_EMBED_MODEL_ID = unquote(
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
 # Higher demo limits
-MAX_FILES = int(os.getenv("MAX_FILES", "200"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "200"))
-MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "2000"))
+MAX_FILES = int(os.getenv("MAX_FILES", "300"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
+MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "3000"))
 MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "50000"))
 
 TOP_K = int(os.getenv("TOP_K", "6"))
@@ -409,8 +421,37 @@ class _HTMLTextExtractor(HTMLParser):
 
 def _clean_whitespace(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\r\n?", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+def _strip_xml_tags(xml_text: str) -> str:
+    try:
+        root = ET.fromstring(xml_text)
+        parts: List[str] = []
+        for elem in root.iter():
+            if elem.text and elem.text.strip():
+                parts.append(elem.text.strip())
+            if elem.tail and elem.tail.strip():
+                parts.append(elem.tail.strip())
+        return _clean_whitespace("\n".join(parts))
+    except Exception:
+        return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml_text))
+
+def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            parts: List[str] = []
+            for name in member_names:
+                if name in zf.namelist():
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    cleaned = _strip_xml_tags(xml_text)
+                    if cleaned:
+                        parts.append(cleaned)
+            return _clean_whitespace("\n\n".join(parts))
+    except Exception:
+        return ""
+    return ""
 
 def read_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -427,12 +468,34 @@ def read_excel(file_bytes: bytes) -> str:
     df = pd.read_excel(io.BytesIO(file_bytes))
     return df.to_csv(index=False)
 
+def read_xlsb(file_bytes: bytes) -> str:
+    df = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb")
+    return df.to_csv(index=False)
+
+def read_parquet(file_bytes: bytes) -> str:
+    df = pd.read_parquet(io.BytesIO(file_bytes))
+    return df.to_csv(index=False)
+
 def read_json(file_bytes: bytes) -> str:
     try:
         obj = json.loads(file_bytes.decode("utf-8", errors="ignore"))
         return json.dumps(obj, ensure_ascii=False, indent=2)
     except Exception:
         return file_bytes.decode("utf-8", errors="ignore").strip()
+
+def read_jsonl(file_bytes: bytes) -> str:
+    text = file_bytes.decode("utf-8", errors="ignore")
+    rows: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            rows.append(json.dumps(obj, ensure_ascii=False))
+        except Exception:
+            rows.append(line)
+    return _clean_whitespace("\n".join(rows))
 
 def read_yaml(file_bytes: bytes) -> str:
     try:
@@ -493,6 +556,114 @@ def read_pptx(file_bytes: bytes) -> str:
             if txt and str(txt).strip():
                 parts.append(str(txt).strip())
     return _clean_whitespace("\n".join(parts))
+
+def read_odt(file_bytes: bytes) -> str:
+    return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
+
+def read_ods(file_bytes: bytes) -> str:
+    return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
+
+def read_odp(file_bytes: bytes) -> str:
+    return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
+
+def _extract_printable_utf16le(blob: bytes) -> List[str]:
+    text = blob.decode("utf-16le", errors="ignore")
+    candidates = re.findall(r"[\x20-\x7E][\x20-\x7E\n\r\t]{3,}", text)
+    return [c.strip() for c in candidates if c.strip()]
+
+def _extract_printable_utf8(blob: bytes) -> List[str]:
+    text = blob.decode("utf-8", errors="ignore")
+    candidates = re.findall(r"[A-Za-z0-9][^\x00]{3,}", text)
+    return [c.strip() for c in candidates if c.strip()]
+
+def read_doc_legacy(file_bytes: bytes) -> str:
+    if olefile is None:
+        return ""
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            pieces: List[str] = []
+            for stream_name in ole.listdir():
+                joined = "/".join(stream_name)
+                if joined in ("WordDocument", "1Table", "0Table"):
+                    try:
+                        blob = ole.openstream(stream_name).read()
+                        pieces.extend(_extract_printable_utf16le(blob))
+                        pieces.extend(_extract_printable_utf8(blob))
+                    except Exception:
+                        continue
+            return _clean_whitespace("\n".join(dict.fromkeys(pieces)))
+    except Exception:
+        return ""
+
+def read_ppt_legacy(file_bytes: bytes) -> str:
+    if olefile is None:
+        return ""
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            pieces: List[str] = []
+            for stream_name in ole.listdir():
+                joined = "/".join(stream_name)
+                if joined == "PowerPoint Document":
+                    try:
+                        blob = ole.openstream(stream_name).read()
+                        pieces.extend(_extract_printable_utf16le(blob))
+                        pieces.extend(_extract_printable_utf8(blob))
+                    except Exception:
+                        continue
+            return _clean_whitespace("\n".join(dict.fromkeys(pieces)))
+    except Exception:
+        return ""
+
+def read_msg(file_bytes: bytes) -> str:
+    if extract_msg is not None:
+        tmp_path = None
+        try:
+            tmp_dir = Path("/tmp")
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = tmp_dir / f"msg_{uuid.uuid4().hex}.msg"
+            tmp_path.write_bytes(file_bytes)
+
+            msg = extract_msg.Message(str(tmp_path))
+            parts: List[str] = []
+            if getattr(msg, "subject", None):
+                parts.append(f"Subject: {msg.subject}")
+            if getattr(msg, "sender", None):
+                parts.append(f"From: {msg.sender}")
+            if getattr(msg, "to", None):
+                parts.append(f"To: {msg.to}")
+            if getattr(msg, "date", None):
+                parts.append(f"Date: {msg.date}")
+            body = getattr(msg, "body", "") or ""
+            if body.strip():
+                parts.append("")
+                parts.append(body.strip())
+            return _clean_whitespace("\n".join(parts))
+        except Exception:
+            pass
+        finally:
+            try:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+    if olefile is None:
+        return ""
+
+    try:
+        with olefile.OleFileIO(io.BytesIO(file_bytes)) as ole:
+            parts: List[str] = []
+            for stream_name in ole.listdir():
+                joined = "/".join(stream_name)
+                if "__substg1.0_" in joined:
+                    try:
+                        blob = ole.openstream(stream_name).read()
+                        parts.extend(_extract_printable_utf16le(blob))
+                    except Exception:
+                        continue
+            return _clean_whitespace("\n".join(dict.fromkeys(parts)))
+    except Exception:
+        return ""
 
 def read_ipynb(file_bytes: bytes) -> str:
     try:
@@ -576,7 +747,9 @@ CODE_EXTS = (
     ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala", ".sh", ".bash", ".zsh",
     ".ps1", ".sql", ".toml", ".env", ".dockerfile"
 )
-TEXTY_EXTS = (".txt", ".md", ".log", ".cfg", ".conf", ".ini")
+TEXTY_EXTS = (
+    ".txt", ".md", ".log", ".cfg", ".conf", ".ini", ".rst", ".tex"
+)
 
 def file_to_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
@@ -584,10 +757,23 @@ def file_to_text(uploaded_file) -> str:
 
     if name.endswith(".pdf"):
         return read_pdf(b)
+
     if name.endswith(".docx"):
         return read_docx(b)
+    if name.endswith(".doc"):
+        return read_doc_legacy(b)
+
     if name.endswith(".pptx"):
         return read_pptx(b)
+    if name.endswith(".ppt"):
+        return read_ppt_legacy(b)
+
+    if name.endswith(".odt"):
+        return read_odt(b)
+    if name.endswith(".ods"):
+        return read_ods(b)
+    if name.endswith(".odp"):
+        return read_odp(b)
 
     if name.endswith(".csv"):
         return read_csv(b, sep=",")
@@ -595,8 +781,12 @@ def file_to_text(uploaded_file) -> str:
         return read_csv(b, sep="\t")
     if name.endswith(".psv"):
         return read_csv(b, sep="|")
+    if name.endswith(".xlsb"):
+        return read_xlsb(b)
     if name.endswith((".xls", ".xlsx")):
         return read_excel(b)
+    if name.endswith(".parquet"):
+        return read_parquet(b)
 
     if name.endswith((".html", ".htm")):
         return read_html(b)
@@ -611,10 +801,16 @@ def file_to_text(uploaded_file) -> str:
         return read_ipynb(b)
     if name.endswith(".eml"):
         return read_eml(b)
+    if name.endswith(".msg"):
+        return read_msg(b)
     if name.endswith(".rtf"):
         return read_rtf(b)
+
     if name.endswith(".json"):
         return read_json(b)
+    if name.endswith((".jsonl", ".ndjson")):
+        return read_jsonl(b)
+
     if name.endswith(CODE_EXTS) or name.endswith(TEXTY_EXTS):
         return read_txt(b)
 
@@ -888,7 +1084,7 @@ def main():
 
                 if n == 0:
                     st.warning(
-                        "I couldn’t extract text from those files. Try PDF, DOCX, PPTX, TXT, CSV, XLSX, HTML, XML, YAML, JSON, IPYNB, EML, or RTF."
+                        "I couldn’t extract text from those files. Supported examples include PDF, DOC/DOCX, PPT/PPTX, ODT/ODS/ODP, TXT, CSV, XLS/XLSX/XLSB, Parquet, HTML, XML, YAML, JSON, JSONL, NDJSON, IPYNB, EML, MSG, RTF, RST, TEX, and code/text files."
                     )
                 else:
                     st.success("Ready. Ask your questions below.")
