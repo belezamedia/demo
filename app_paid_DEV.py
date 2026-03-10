@@ -82,9 +82,9 @@ BEDROCK_EMBED_MODEL_ID = unquote(
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
 # Higher demo limits
-MAX_FILES = int(os.getenv("MAX_FILES", "200"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "200"))
-MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "2000"))
+MAX_FILES = int(os.getenv("MAX_FILES", "300"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
+MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "3000"))
 MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "50000"))
 
 TOP_K = int(os.getenv("TOP_K", "6"))
