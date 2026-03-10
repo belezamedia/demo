@@ -53,7 +53,7 @@ except Exception:
 # ============================
 # CONFIG
 # ============================
-APP_TITLE = "[ Your ] Ai Chatbot"
+APP_TITLE = "DocHelp.Ai"
 BRAND_PINK = "#1F4ED8"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
@@ -210,7 +210,7 @@ def login_gate() -> None:
         return
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">Your Private AI for Documents</div>', unsafe_allow_html=True)
 
     if not (APP_USERNAME and APP_PASSWORD):
         st.error("Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud).")
@@ -796,11 +796,11 @@ def main():
     touch_activity(workspace_id)
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">Private Intelligence for your Documents</div>', unsafe_allow_html=True)
 
     if not st.session_state.indexed:
         st.markdown(
-            '<div class="gothic-sub">Upload your Private Files, Get Your Answers Fast and Easy</div>',
+            '<div class="gothic-sub">Ask Questions to Your Documents</div>',
             unsafe_allow_html=True,
         )
 

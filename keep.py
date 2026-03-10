@@ -1,4 +1,4 @@
-# app_PAID_DEV.py new
+# app.py
 # [ Your ] Ai Chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
 # ✅ Login screen (username + password) ALWAYS appears first (even on localhost)
 # ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
@@ -53,7 +53,7 @@ except Exception:
 # ============================
 # CONFIG
 # ============================
-APP_TITLE = "DocHelp.Ai"
+APP_TITLE = "[ Your ] Ai Chatbot"
 BRAND_PINK = "#1F4ED8"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
@@ -63,11 +63,9 @@ BEDROCK_EMBED_MODEL_ID = unquote(os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.tit
 
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
-# ✅ SAFER, HIGHER LIMITS (override via env vars)
-MAX_FILES = int(os.getenv("MAX_FILES", "50"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "50"))
-MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "200"))
-MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "8000"))
+MAX_FILES = int(os.getenv("MAX_FILES", "15"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "20"))
+MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "2000"))
 TOP_K = int(os.getenv("TOP_K", "4"))
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
@@ -210,7 +208,7 @@ def login_gate() -> None:
         return
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Your Private AI for Documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
 
     if not (APP_USERNAME and APP_PASSWORD):
         st.error("Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud).")
@@ -464,6 +462,7 @@ def read_pptx(file_bytes: bytes) -> str:
     parts: List[str] = []
     for slide in pres.slides:
         for shape in slide.shapes:
+            # shape.text exists for text-containing shapes
             txt = getattr(shape, "text", None)
             if txt and str(txt).strip():
                 parts.append(str(txt).strip())
@@ -540,23 +539,27 @@ def read_rtf(file_bytes: bytes) -> str:
             return _clean_whitespace(_rtf_to_text(raw))
         except Exception:
             pass
+    # fallback: best-effort strip RTF control words
     fallback = re.sub(r"{\\.*?}|\\[a-zA-Z]+\d* ?", " ", raw)
     return _clean_whitespace(fallback)
 
 def read_txt(file_bytes: bytes) -> str:
     return _clean_whitespace(file_bytes.decode("utf-8", errors="ignore"))
 
+# Common code / text extensions to treat as plain text
 CODE_EXTS = (
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cpp", ".h", ".hpp", ".go",
     ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala", ".sh", ".bash", ".zsh",
     ".ps1", ".sql", ".toml", ".env", ".dockerfile"
 )
+
 TEXTY_EXTS = (".txt", ".md", ".log", ".cfg", ".conf", ".ini")
 
 def file_to_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
     b = uploaded_file.read()
 
+    # Structured/document formats
     if name.endswith(".pdf"):
         return read_pdf(b)
     if name.endswith(".docx"):
@@ -564,6 +567,7 @@ def file_to_text(uploaded_file) -> str:
     if name.endswith(".pptx"):
         return read_pptx(b)
 
+    # Data formats
     if name.endswith(".csv"):
         return read_csv(b, sep=",")
     if name.endswith(".tsv"):
@@ -573,6 +577,7 @@ def file_to_text(uploaded_file) -> str:
     if name.endswith((".xls", ".xlsx")):
         return read_excel(b)
 
+    # Markup/config formats
     if name.endswith((".html", ".htm")):
         return read_html(b)
     if name.endswith(".xml"):
@@ -582,20 +587,25 @@ def file_to_text(uploaded_file) -> str:
     if name.endswith((".ini", ".cfg", ".conf")):
         return read_ini(b)
 
+    # Notebook/email
     if name.endswith(".ipynb"):
         return read_ipynb(b)
     if name.endswith(".eml"):
         return read_eml(b)
 
+    # RTF
     if name.endswith(".rtf"):
         return read_rtf(b)
 
+    # JSON
     if name.endswith(".json"):
         return read_json(b)
 
+    # Code / plain text
     if name.endswith(CODE_EXTS) or name.endswith(TEXTY_EXTS):
         return read_txt(b)
 
+    # Allow upload of anything else (jpg/png/mp4/etc), but don't index it (no text extracted here).
     return ""
 
 def validate_uploads(files) -> Tuple[bool, str]:
@@ -603,23 +613,10 @@ def validate_uploads(files) -> Tuple[bool, str]:
         return False, "Please upload at least one file."
     if len(files) > MAX_FILES:
         return False, f"Too many files. Max is {MAX_FILES}."
-
-    total_bytes = 0
     for f in files:
-        size_bytes = int(getattr(f, "size", 0) or 0)
-        total_bytes += size_bytes
-
-        size_mb = size_bytes / (1024 * 1024)
+        size_mb = (getattr(f, "size", 0) or 0) / (1024 * 1024)
         if size_mb > MAX_FILE_MB:
             return False, f"File '{f.name}' is too large ({size_mb:.1f} MB). Max is {MAX_FILE_MB} MB."
-
-    total_mb = total_bytes / (1024 * 1024)
-    if total_mb > MAX_TOTAL_UPLOAD_MB:
-        return False, (
-            f"Total upload too large ({total_mb:.1f} MB). "
-            f"Max total is {MAX_TOTAL_UPLOAD_MB} MB across all files."
-        )
-
     return True, ""
 
 # ============================
@@ -796,11 +793,11 @@ def main():
     touch_activity(workspace_id)
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Private Intelligence for your Documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">private intelligence for your documents</div>', unsafe_allow_html=True)
 
     if not st.session_state.indexed:
         st.markdown(
-            '<div class="gothic-sub">Ask Questions to Your Documents</div>',
+            '<div class="gothic-sub">Upload your Private Files, Get Your Answers Fast and Easy</div>',
             unsafe_allow_html=True,
         )
 
@@ -840,7 +837,7 @@ def main():
         st.markdown(
             f"""
 <div class="small-foot">
-<em>your files are automatically deleted after {IDLE_TTL_SECONDS//60} min idle or {WORKSPACE_TTL_SECONDS//3600} hrs • limits: {MAX_FILES} files • {MAX_FILE_MB}mb each • {MAX_TOTAL_UPLOAD_MB}mb total</em><br/>
+<em>your files are automatically deleted after {IDLE_TTL_SECONDS//60} min idle or {WORKSPACE_TTL_SECONDS//3600} hrs • limits: {MAX_FILES} files • {MAX_FILE_MB}mb each</em><br/>
 <em>*this is a demo website, please upload only sample docs, and nothing private</em><br/>
 <strong>contact@belezamedia.org</strong> for your private custom chatbot
 </div>
