@@ -1,6 +1,6 @@
-# app_PAID_DEV.py new
-# [ Your ] Ai Chatbot — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
-# ✅ Login screen (username + password) ALWAYS appears first (even on localhost)
+# app_PAID_DEV.py
+# DocHelp.AI — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
+# ✅ Login screen (username + password) ALWAYS appears first
 # ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
 # ✅ Auto-deletes user data via TTL + idle timeout + janitor sweep
 # ✅ Optimized for Streamlit Cloud: cached Bedrock clients, cached splitter, guarded config
@@ -16,7 +16,7 @@ import hmac
 import hashlib
 import configparser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import unquote, quote
 from html.parser import HTMLParser
 from email import policy
@@ -33,27 +33,27 @@ try:
 except Exception:
     pass
 
-# Core deps (keep imports straightforward for Streamlit Cloud)
+# Core deps
 import pandas as pd
 import yaml
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from pptx import Presentation  # python-pptx
+from pptx import Presentation
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_aws import ChatBedrockConverse, BedrockEmbeddings
 
-# Optional (better RTF parsing) — if not installed, we gracefully fall back
+# Optional RTF parser
 try:
-    from striprtf.striprtf import rtf_to_text as _rtf_to_text  # striprtf
+    from striprtf.striprtf import rtf_to_text as _rtf_to_text
 except Exception:
     _rtf_to_text = None
 
 # ============================
 # CONFIG
 # ============================
-APP_TITLE = "DocHelp.Ai"
+APP_TITLE = "DocHelp.AI"
 BRAND_PINK = "#1F4ED8"
 
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
@@ -63,7 +63,6 @@ BEDROCK_EMBED_MODEL_ID = unquote(os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.tit
 
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
-# ✅ SAFER, HIGHER LIMITS (override via env vars)
 MAX_FILES = int(os.getenv("MAX_FILES", "50"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "50"))
 MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "200"))
@@ -73,20 +72,17 @@ TOP_K = int(os.getenv("TOP_K", "4"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 
-# Auto-delete
 WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))  # 2 hours
 IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))            # 30 minutes
 JANITOR_MAX_DELETE = int(os.getenv("JANITOR_MAX_DELETE", "50"))
 META_FILENAME = "_meta.json"
 
-# Tenant signing (set in Secrets)
 TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
 
-# Login creds (MUST be set; login is always required)
 APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 
-SYSTEM_PROMPT = """You are an AI helpful assistant.
+SYSTEM_PROMPT = """You are a helpful AI assistant.
 You MUST answer using ONLY the provided context from the uploaded files.
 If the answer is not in the context, say: "I don't know based on the uploaded files."
 Be concise and direct.
@@ -98,40 +94,45 @@ No markdown. No extra keys. No explanations.
 """
 
 # ============================
-# UI / STYLES (KEEP SAME LOOK)
+# UI / STYLES
 # ============================
 def inject_styles():
     st.markdown(
         f"""
 <style>
-/* Replaced Old English (UnifrakturCook) with Inter — everything else unchanged */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 :root {{
-  --beleza-pink: {BRAND_PINK};
+  --brand-blue: {BRAND_PINK};
+}}
+
+html, body, [class*="css"] {{
+  font-family: 'Inter', sans-serif;
 }}
 
 .gothic-title {{
   font-family: 'Inter', sans-serif;
-  font-size: 58px;
+  font-size: 56px;
+  font-weight: 700;
   line-height: 1.0;
   text-align: center;
   margin-top: 0.5rem;
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.35rem;
 }}
 
 .gothic-sub {{
   font-family: 'Inter', sans-serif;
-  font-size: 22px;
+  font-size: 20px;
+  font-weight: 600;
   text-align: center;
-  margin-bottom: 1rem;
+  margin-bottom: 0.75rem;
 }}
 
 .center-note {{
   text-align: center;
-  font-size: 16px;
-  color: rgba(0,0,0,0.65);
-  margin-bottom: 1.25rem;
+  font-size: 18px;
+  color: rgba(0,0,0,0.72);
+  margin-bottom: 1rem;
 }}
 
 .small-foot {{
@@ -139,57 +140,67 @@ def inject_styles():
   font-size: 13px;
   color: rgba(0,0,0,0.65);
   margin-top: 1rem;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  line-height: 1.6;
+  line-height: 1.65;
 }}
-.small-foot em {{ font-style: italic; }}
 
-/* Hide Streamlit chrome */
+.small-foot em {{
+  font-style: italic;
+}}
+
+.small-muted {{
+  text-align: center;
+  font-size: 13px;
+  color: rgba(0,0,0,0.58);
+  margin-top: 0.25rem;
+  margin-bottom: 0.5rem;
+}}
+
 #MainMenu {{visibility: hidden;}}
 footer {{visibility: hidden;}}
 header {{visibility: hidden;}}
 
-/* Primary button: Beleza pink + (formerly Old English) -> Inter */
 button[kind="primary"] {{
-  background: var(--beleza-pink) !important;
-  border: 1px solid var(--beleza-pink) !important;
+  background: var(--brand-blue) !important;
+  border: 1px solid var(--brand-blue) !important;
   color: white !important;
   font-family: 'Inter', sans-serif !important;
-  letter-spacing: 0.2px;
 }}
+
 div.stButton > button {{
   border-radius: 12px !important;
   padding: 0.65rem 1rem !important;
 }}
 
-/* Text inputs look premium */
 div[data-testid="stTextInput"] input {{
-  border: 2px solid var(--beleza-pink) !important;
+  border: 2px solid var(--brand-blue) !important;
   border-radius: 14px !important;
   box-shadow: none !important;
-}}
-div[data-testid="stTextInput"] input:focus {{
-  border: 2px solid var(--beleza-pink) !important;
-  outline: none !important;
-  box-shadow: 0 0 0 3px rgba(254,95,154,0.18) !important;
 }}
 
-/* --- Chat input: pink outline + pink send button --- */
+div[data-testid="stTextInput"] input:focus {{
+  border: 2px solid var(--brand-blue) !important;
+  outline: none !important;
+  box-shadow: 0 0 0 3px rgba(31, 78, 216, 0.15) !important;
+}}
+
 div[data-testid="stChatInput"] textarea {{
-  border: 2px solid var(--beleza-pink) !important;
+  border: 2px solid var(--brand-blue) !important;
   border-radius: 14px !important;
   box-shadow: none !important;
 }}
+
 div[data-testid="stChatInput"] textarea:focus {{
-  border: 2px solid var(--beleza-pink) !important;
+  border: 2px solid var(--brand-blue) !important;
   outline: none !important;
-  box-shadow: 0 0 0 3px rgba(254,95,154,0.18) !important;
+  box-shadow: 0 0 0 3px rgba(31, 78, 216, 0.15) !important;
 }}
+
 div[data-testid="stChatInput"] button {{
   border-radius: 12px !important;
-  border: 1px solid var(--beleza-pink) !important;
-  background: var(--beleza-pink) !important;
+  border: 1px solid var(--brand-blue) !important;
+  background: var(--brand-blue) !important;
 }}
+
 div[data-testid="stChatInput"] button svg {{
   fill: white !important;
   stroke: white !important;
@@ -200,32 +211,29 @@ div[data-testid="stChatInput"] button svg {{
     )
 
 # ============================
-# LOGIN GATE (ALWAYS ON)
+# LOGIN GATE
 # ============================
 def login_gate() -> None:
-    """
-    Always require login. If creds aren't set, show a helpful error.
-    """
     if st.session_state.get("authed") is True:
         return
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Your Private AI for Documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">Private AI for Your Documents</div>', unsafe_allow_html=True)
 
     if not (APP_USERNAME and APP_PASSWORD):
         st.error("Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud).")
         st.stop()
 
-    st.markdown('<div class="gothic-sub">login</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gothic-sub">Login</div>', unsafe_allow_html=True)
 
     u = st.text_input("username", label_visibility="collapsed", placeholder="username")
     p = st.text_input("password", type="password", label_visibility="collapsed", placeholder="password")
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        go = st.button("enter", type="primary", use_container_width=True)
+        go = st.button("Enter", type="primary", use_container_width=True)
     with c2:
-        if st.button("reset", use_container_width=True):
+        if st.button("Reset", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
@@ -234,7 +242,7 @@ def login_gate() -> None:
             st.session_state["authed"] = True
             st.rerun()
         else:
-            st.error("invalid username or password")
+            st.error("Invalid username or password.")
 
     st.stop()
 
@@ -245,11 +253,9 @@ def _b(x: str) -> bytes:
     return (x or "").encode("utf-8")
 
 def _is_streamlit_cloud() -> bool:
-    # /mount/src exists on Streamlit Cloud; safe heuristic
     return Path("/mount/src").exists()
 
 def sign_token(token: str) -> str:
-    # Require real key on Streamlit Cloud; allow fallback locally
     if _is_streamlit_cloud() and not TENANT_SIGNING_KEY:
         raise RuntimeError("TENANT_SIGNING_KEY must be set in Streamlit Secrets.")
     key = TENANT_SIGNING_KEY or "insecure-dev-key-change-me"
@@ -303,7 +309,7 @@ def ensure_tenant_context() -> str:
     return ws
 
 # ============================
-# AVATAR (PINK ROBOT)
+# AVATAR
 # ============================
 def assistant_avatar_data_uri(color_hex: str) -> str:
     svg = f"""
@@ -322,7 +328,7 @@ def assistant_avatar_data_uri(color_hex: str) -> str:
 ASSISTANT_AVATAR = assistant_avatar_data_uri(BRAND_PINK)
 
 # ============================
-# CACHED RESOURCES (FAST)
+# CACHED RESOURCES
 # ============================
 @st.cache_resource(show_spinner=False)
 def get_splitter() -> RecursiveCharacterTextSplitter:
@@ -441,7 +447,6 @@ def read_xml(file_bytes: bytes) -> str:
                 parts.append(elem.tail.strip())
         return _clean_whitespace("\n".join(parts))
     except Exception:
-        # fallback: strip tags crudely
         xml = file_bytes.decode("utf-8", errors="ignore")
         return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml))
 
@@ -586,13 +591,10 @@ def file_to_text(uploaded_file) -> str:
         return read_ipynb(b)
     if name.endswith(".eml"):
         return read_eml(b)
-
     if name.endswith(".rtf"):
         return read_rtf(b)
-
     if name.endswith(".json"):
         return read_json(b)
-
     if name.endswith(CODE_EXTS) or name.endswith(TEXTY_EXTS):
         return read_txt(b)
 
@@ -615,10 +617,7 @@ def validate_uploads(files) -> Tuple[bool, str]:
 
     total_mb = total_bytes / (1024 * 1024)
     if total_mb > MAX_TOTAL_UPLOAD_MB:
-        return False, (
-            f"Total upload too large ({total_mb:.1f} MB). "
-            f"Max total is {MAX_TOTAL_UPLOAD_MB} MB across all files."
-        )
+        return False, f"Total upload too large ({total_mb:.1f} MB). Max total is {MAX_TOTAL_UPLOAD_MB} MB."
 
     return True, ""
 
@@ -753,7 +752,7 @@ def rag_answer(workspace_id: str, question: str) -> str:
     docs = vectordb.similarity_search(question, k=TOP_K)
 
     context = "\n\n".join(
-        f"[{d.metadata.get('source','unknown')} #{d.metadata.get('chunk',0)}] {d.page_content}"
+        f"[{d.metadata.get('source', 'unknown')} #{d.metadata.get('chunk', 0)}] {d.page_content}"
         for d in docs
     )
 
@@ -774,14 +773,11 @@ Question: {question}
 # STREAMLIT APP
 # ============================
 def main():
+    st.set_page_config(page_title=APP_TITLE, layout="centered")
     janitor_sweep()
-    st.set_page_config(APP_TITLE, layout="centered")
     inject_styles()
 
-    # ✅ ALWAYS show login screen first
     login_gate()
-
-    # Tenant context + app
     workspace_id = ensure_tenant_context()
 
     if "messages" not in st.session_state:
@@ -796,19 +792,24 @@ def main():
     touch_activity(workspace_id)
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Private Intelligence for your Documents</div>', unsafe_allow_html=True)
+    st.markdown('<div class="center-note">Ask Questions About Your Documents</div>', unsafe_allow_html=True)
 
     if not st.session_state.indexed:
         st.markdown(
-            '<div class="gothic-sub">Ask Questions to Your Documents</div>',
+            '<div class="gothic-sub">Upload Documents and Ask Questions Instantly</div>',
             unsafe_allow_html=True,
         )
 
         uploaded = st.file_uploader(
-            "Upload files (many types supported)",
-            type=None,  # ✅ allow ANY file extension
+            "Upload files",
+            type=None,
             accept_multiple_files=True,
-            label_visibility="collapsed",
+            label_visibility="visible",
+        )
+
+        st.markdown(
+            f'<div class="small-muted">Up to {MAX_FILES} files • {MAX_FILE_MB}MB max per file • {MAX_TOTAL_UPLOAD_MB}MB total</div>',
+            unsafe_allow_html=True,
         )
 
         c1, c2 = st.columns([2, 1])
@@ -828,10 +829,7 @@ def main():
                     n = index_files(workspace_id, uploaded)
                 if n == 0:
                     st.warning(
-                        "I couldn’t extract any text from those files. "
-                        "Try: PDF, DOCX, PPTX, TXT/MD/LOG, CSV/TSV/PSV, XLS/XLSX, "
-                        "HTML, XML, YAML/YML, INI/CFG/CONF, JSON, IPYNB, EML, RTF. "
-                        "Images/videos are allowed but won’t be indexed in this demo."
+                        "I couldn’t extract text from those files. Try PDF, DOCX, PPTX, TXT, CSV, XLSX, HTML, XML, YAML, JSON, IPYNB, EML, or RTF."
                     )
                 else:
                     st.success("Ready. Ask your questions below.")
@@ -840,9 +838,9 @@ def main():
         st.markdown(
             f"""
 <div class="small-foot">
-<em>your files are automatically deleted after {IDLE_TTL_SECONDS//60} min idle or {WORKSPACE_TTL_SECONDS//3600} hrs • limits: {MAX_FILES} files • {MAX_FILE_MB}mb each • {MAX_TOTAL_UPLOAD_MB}mb total</em><br/>
-<em>*this is a demo website, please upload only sample docs, and nothing private</em><br/>
-message <strong>linkedin.com/in/thedannyscott</strong> for your questions
+Files are automatically deleted after <strong>{IDLE_TTL_SECONDS // 60} minutes of inactivity</strong> or <strong>{WORKSPACE_TTL_SECONDS // 3600} hours maximum session time</strong>.<br/>
+<em>This is a demo environment. Please upload sample documents only.</em><br/>
+Questions or custom deployments: <strong>linkedin.com/in/thedannyscott</strong>
 </div>
 """,
             unsafe_allow_html=True,
