@@ -842,7 +842,7 @@ def main():
 <div class="small-foot">
 <em>your files are automatically deleted after {IDLE_TTL_SECONDS//60} min idle or {WORKSPACE_TTL_SECONDS//3600} hrs • limits: {MAX_FILES} files • {MAX_FILE_MB}mb each • {MAX_TOTAL_UPLOAD_MB}mb total</em><br/>
 <em>*this is a demo website, please upload only sample docs, and nothing private</em><br/>
-<strong>contact@belezamedia.org</strong> for your private custom chatbot
+message <strong>linkedin.com/in/thedannyscott</strong> for your questions
 </div>
 """,
             unsafe_allow_html=True,
