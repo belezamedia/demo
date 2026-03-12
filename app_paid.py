@@ -1,12 +1,5 @@
-# app_PAID_DEV.py
+# app_paid.py
 # DocHelp.AI — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
-# ✅ Login screen (username + password) ALWAYS appears first
-# ✅ Strong tenant isolation via signed URL token + per-tenant workspace hashing
-# ✅ Auto-deletes user data via TTL + idle timeout + janitor sweep
-# ✅ Optimized for Streamlit Cloud: cached Bedrock clients, cached splitter, guarded config
-# ✅ Higher upload/file limits for demo usage
-# ✅ Lower hallucination risk with stricter grounding + business tone
-# ✅ Added support for ODT/ODS/ODP, DOC/PPT, MSG, XLSB, Parquet, NDJSON/JSONL, TS, RST, TEX
 
 import os
 import io
@@ -64,6 +57,7 @@ try:
 except Exception:
     olefile = None
 
+
 # ============================
 # CONFIG
 # ============================
@@ -81,7 +75,6 @@ BEDROCK_EMBED_MODEL_ID = unquote(
 
 CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 
-# Higher demo limits
 MAX_FILES = int(os.getenv("MAX_FILES", "300"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
 MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "3000"))
@@ -118,6 +111,7 @@ Return VALID JSON only in this format:
 
 No markdown. No extra keys. No explanations.
 """
+
 
 # ============================
 # UI / STYLES
@@ -181,6 +175,13 @@ html, body, [class*="css"] {{
   margin-bottom: 0.5rem;
 }}
 
+.small-success {{
+  font-size: 13px;
+  color: rgba(0,0,0,0.72);
+  margin-top: 0.25rem;
+  margin-bottom: 0.5rem;
+}}
+
 #MainMenu {{visibility: hidden;}}
 footer {{visibility: hidden;}}
 header {{visibility: hidden;}}
@@ -236,6 +237,7 @@ div[data-testid="stChatInput"] button svg {{
         unsafe_allow_html=True,
     )
 
+
 # ============================
 # LOGIN GATE
 # ============================
@@ -272,14 +274,17 @@ def login_gate() -> None:
 
     st.stop()
 
+
 # ============================
 # TENANT ISOLATION
 # ============================
 def _b(x: str) -> bytes:
     return (x or "").encode("utf-8")
 
+
 def _is_streamlit_cloud() -> bool:
     return Path("/mount/src").exists()
+
 
 def sign_token(token: str) -> str:
     if _is_streamlit_cloud() and not TENANT_SIGNING_KEY:
@@ -287,14 +292,17 @@ def sign_token(token: str) -> str:
     key = TENANT_SIGNING_KEY or "insecure-dev-key-change-me"
     return hmac.new(_b(key), _b(token), hashlib.sha256).hexdigest()
 
+
 def verify_token(token: str, sig: str) -> bool:
     if not token or not sig:
         return False
     expected = sign_token(token)
     return hmac.compare_digest(expected, sig)
 
+
 def workspace_id_from_token(token: str) -> str:
     return hashlib.sha256(_b(token)).hexdigest()
+
 
 def set_query_params(token: str, sig: str) -> None:
     try:
@@ -306,6 +314,7 @@ def set_query_params(token: str, sig: str) -> None:
         except Exception:
             pass
 
+
 def get_query_params() -> Dict[str, str]:
     try:
         qp = st.query_params
@@ -313,6 +322,7 @@ def get_query_params() -> Dict[str, str]:
     except Exception:
         qp = st.experimental_get_query_params()
         return {"t": (qp.get("t", [""]) or [""])[0], "sig": (qp.get("sig", [""]) or [""])[0]}
+
 
 def ensure_tenant_context() -> str:
     qp = get_query_params()
@@ -334,6 +344,7 @@ def ensure_tenant_context() -> str:
     st.session_state["workspace_id"] = ws
     return ws
 
+
 # ============================
 # AVATAR
 # ============================
@@ -351,7 +362,9 @@ def assistant_avatar_data_uri(color_hex: str) -> str:
     """.strip()
     return "data:image/svg+xml;utf8," + quote(svg)
 
+
 ASSISTANT_AVATAR = assistant_avatar_data_uri(BRAND_PINK)
+
 
 # ============================
 # CACHED RESOURCES
@@ -363,12 +376,14 @@ def get_splitter() -> RecursiveCharacterTextSplitter:
         chunk_overlap=CHUNK_OVERLAP,
     )
 
+
 @st.cache_resource(show_spinner=False)
 def get_embeddings() -> BedrockEmbeddings:
     return BedrockEmbeddings(
         region_name=DEFAULT_REGION,
         model_id=BEDROCK_EMBED_MODEL_ID,
     )
+
 
 @st.cache_resource(show_spinner=False)
 def get_llm() -> ChatBedrockConverse:
@@ -378,6 +393,7 @@ def get_llm() -> ChatBedrockConverse:
         temperature=0.0,
         max_tokens=500,
     )
+
 
 # ============================
 # BEDROCK STREAMING
@@ -391,6 +407,7 @@ def _extract_text(obj: Any) -> str:
         return "".join(x.get("text", "") for x in obj if isinstance(x, dict))
     return ""
 
+
 def generate_streaming(prompt: str) -> str:
     llm = get_llm()
     parts: List[str] = []
@@ -403,6 +420,7 @@ def generate_streaming(prompt: str) -> str:
     except Exception:
         resp = llm.invoke(prompt)
         return _extract_text(resp)
+
 
 # ============================
 # FILE PARSING
@@ -419,11 +437,13 @@ class _HTMLTextExtractor(HTMLParser):
     def get_text(self) -> str:
         return " ".join(self._chunks).strip()
 
+
 def _clean_whitespace(s: str) -> str:
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\r\n?", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
 
 def _strip_xml_tags(xml_text: str) -> str:
     try:
@@ -437,6 +457,7 @@ def _strip_xml_tags(xml_text: str) -> str:
         return _clean_whitespace("\n".join(parts))
     except Exception:
         return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml_text))
+
 
 def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
     try:
@@ -453,6 +474,7 @@ def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
         return ""
     return ""
 
+
 def read_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
     texts = []
@@ -460,21 +482,51 @@ def read_pdf(file_bytes: bytes) -> str:
         texts.append(p.extract_text() or "")
     return _clean_whitespace("\n".join(texts))
 
+
 def read_csv(file_bytes: bytes, sep: str = ",") -> str:
     df = pd.read_csv(io.BytesIO(file_bytes), sep=sep)
     return df.to_csv(index=False)
 
-def read_excel(file_bytes: bytes) -> str:
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    return df.to_csv(index=False)
 
-def read_xlsb(file_bytes: bytes) -> str:
-    df = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb")
-    return df.to_csv(index=False)
+def read_excel(file_bytes: bytes, filename: str = "") -> str:
+    name = (filename or "").lower()
+    bio = io.BytesIO(file_bytes)
 
-def read_parquet(file_bytes: bytes) -> str:
-    df = pd.read_parquet(io.BytesIO(file_bytes))
-    return df.to_csv(index=False)
+    try:
+        if name.endswith(".xlsx"):
+            df = pd.read_excel(bio, engine="openpyxl")
+        elif name.endswith(".xls"):
+            df = pd.read_excel(bio, engine="xlrd")
+        else:
+            df = pd.read_excel(bio)
+        return df.to_csv(index=False)
+    except ImportError as e:
+        raise RuntimeError(
+            f"Excel dependency missing for '{filename}'. Make sure openpyxl is installed for .xlsx and xlrd for .xls."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Could not read Excel file '{filename}': {e}") from e
+
+
+def read_xlsb(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        df = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb")
+        return df.to_csv(index=False)
+    except ImportError as e:
+        raise RuntimeError(
+            f"Excel dependency missing for '{filename}'. Make sure pyxlsb is installed for .xlsb files."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Could not read XLSB file '{filename}': {e}") from e
+
+
+def read_parquet(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        df = pd.read_parquet(io.BytesIO(file_bytes))
+        return df.to_csv(index=False)
+    except Exception as e:
+        raise RuntimeError(f"Could not read Parquet file '{filename}': {e}") from e
+
 
 def read_json(file_bytes: bytes) -> str:
     try:
@@ -482,6 +534,7 @@ def read_json(file_bytes: bytes) -> str:
         return json.dumps(obj, ensure_ascii=False, indent=2)
     except Exception:
         return file_bytes.decode("utf-8", errors="ignore").strip()
+
 
 def read_jsonl(file_bytes: bytes) -> str:
     text = file_bytes.decode("utf-8", errors="ignore")
@@ -497,12 +550,14 @@ def read_jsonl(file_bytes: bytes) -> str:
             rows.append(line)
     return _clean_whitespace("\n".join(rows))
 
+
 def read_yaml(file_bytes: bytes) -> str:
     try:
         obj = yaml.safe_load(file_bytes.decode("utf-8", errors="ignore"))
         return yaml.safe_dump(obj, sort_keys=False, allow_unicode=True)
     except Exception:
         return file_bytes.decode("utf-8", errors="ignore").strip()
+
 
 def read_ini(file_bytes: bytes) -> str:
     raw = file_bytes.decode("utf-8", errors="ignore")
@@ -519,6 +574,7 @@ def read_ini(file_bytes: bytes) -> str:
     except Exception:
         return raw.strip()
 
+
 def read_xml(file_bytes: bytes) -> str:
     try:
         root = ET.fromstring(file_bytes)
@@ -533,6 +589,7 @@ def read_xml(file_bytes: bytes) -> str:
         xml = file_bytes.decode("utf-8", errors="ignore")
         return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml))
 
+
 def read_html(file_bytes: bytes) -> str:
     html = file_bytes.decode("utf-8", errors="ignore")
     parser = _HTMLTextExtractor()
@@ -542,10 +599,12 @@ def read_html(file_bytes: bytes) -> str:
     except Exception:
         return _clean_whitespace(re.sub(r"<[^>]+>", " ", html))
 
+
 def read_docx(file_bytes: bytes) -> str:
     doc = DocxDocument(io.BytesIO(file_bytes))
     parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
     return _clean_whitespace("\n".join(parts))
+
 
 def read_pptx(file_bytes: bytes) -> str:
     pres = Presentation(io.BytesIO(file_bytes))
@@ -557,24 +616,30 @@ def read_pptx(file_bytes: bytes) -> str:
                 parts.append(str(txt).strip())
     return _clean_whitespace("\n".join(parts))
 
+
 def read_odt(file_bytes: bytes) -> str:
     return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
+
 
 def read_ods(file_bytes: bytes) -> str:
     return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
 
+
 def read_odp(file_bytes: bytes) -> str:
     return _read_zip_member_text(file_bytes, ["content.xml", "styles.xml", "meta.xml"])
+
 
 def _extract_printable_utf16le(blob: bytes) -> List[str]:
     text = blob.decode("utf-16le", errors="ignore")
     candidates = re.findall(r"[\x20-\x7E][\x20-\x7E\n\r\t]{3,}", text)
     return [c.strip() for c in candidates if c.strip()]
 
+
 def _extract_printable_utf8(blob: bytes) -> List[str]:
     text = blob.decode("utf-8", errors="ignore")
     candidates = re.findall(r"[A-Za-z0-9][^\x00]{3,}", text)
     return [c.strip() for c in candidates if c.strip()]
+
 
 def read_doc_legacy(file_bytes: bytes) -> str:
     if olefile is None:
@@ -595,6 +660,7 @@ def read_doc_legacy(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
+
 def read_ppt_legacy(file_bytes: bytes) -> str:
     if olefile is None:
         return ""
@@ -613,6 +679,7 @@ def read_ppt_legacy(file_bytes: bytes) -> str:
             return _clean_whitespace("\n".join(dict.fromkeys(pieces)))
     except Exception:
         return ""
+
 
 def read_msg(file_bytes: bytes) -> str:
     if extract_msg is not None:
@@ -665,6 +732,7 @@ def read_msg(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
+
 def read_ipynb(file_bytes: bytes) -> str:
     try:
         nb = json.loads(file_bytes.decode("utf-8", errors="ignore"))
@@ -681,6 +749,7 @@ def read_ipynb(file_bytes: bytes) -> str:
         return _clean_whitespace("\n\n".join(parts))
     except Exception:
         return file_bytes.decode("utf-8", errors="ignore").strip()
+
 
 def read_eml(file_bytes: bytes) -> str:
     try:
@@ -729,6 +798,7 @@ def read_eml(file_bytes: bytes) -> str:
     except Exception:
         return file_bytes.decode("utf-8", errors="ignore").strip()
 
+
 def read_rtf(file_bytes: bytes) -> str:
     raw = file_bytes.decode("utf-8", errors="ignore")
     if _rtf_to_text is not None:
@@ -739,8 +809,10 @@ def read_rtf(file_bytes: bytes) -> str:
     fallback = re.sub(r"{\\.*?}|\\[a-zA-Z]+\d* ?", " ", raw)
     return _clean_whitespace(fallback)
 
+
 def read_txt(file_bytes: bytes) -> str:
     return _clean_whitespace(file_bytes.decode("utf-8", errors="ignore"))
+
 
 CODE_EXTS = (
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cpp", ".h", ".hpp", ".go",
@@ -751,9 +823,10 @@ TEXTY_EXTS = (
     ".txt", ".md", ".log", ".cfg", ".conf", ".ini", ".rst", ".tex"
 )
 
+
 def file_to_text(uploaded_file) -> str:
     name = (uploaded_file.name or "").lower()
-    b = uploaded_file.read()
+    b = uploaded_file.getvalue()
 
     if name.endswith(".pdf"):
         return read_pdf(b)
@@ -782,11 +855,11 @@ def file_to_text(uploaded_file) -> str:
     if name.endswith(".psv"):
         return read_csv(b, sep="|")
     if name.endswith(".xlsb"):
-        return read_xlsb(b)
+        return read_xlsb(b, name)
     if name.endswith((".xls", ".xlsx")):
-        return read_excel(b)
+        return read_excel(b, name)
     if name.endswith(".parquet"):
-        return read_parquet(b)
+        return read_parquet(b, name)
 
     if name.endswith((".html", ".htm")):
         return read_html(b)
@@ -816,6 +889,7 @@ def file_to_text(uploaded_file) -> str:
 
     return ""
 
+
 def validate_uploads(files) -> Tuple[bool, str]:
     if not files:
         return False, "Please upload at least one file."
@@ -838,11 +912,13 @@ def validate_uploads(files) -> Tuple[bool, str]:
 
     return True, ""
 
+
 # ============================
 # WORKSPACE META + JANITOR
 # ============================
 def _now() -> int:
     return int(time.time())
+
 
 def read_workspace_meta(d: Path) -> Dict[str, Any]:
     p = d / META_FILENAME
@@ -851,6 +927,7 @@ def read_workspace_meta(d: Path) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def write_workspace_meta(d: Path, created_at: int, last_activity: int) -> None:
     p = d / META_FILENAME
     meta = {"created_at": int(created_at), "last_activity": int(last_activity)}
@@ -858,6 +935,7 @@ def write_workspace_meta(d: Path, created_at: int, last_activity: int) -> None:
         p.write_text(json.dumps(meta), encoding="utf-8")
     except Exception:
         pass
+
 
 def janitor_sweep() -> int:
     if not CHROMA_ROOT.exists():
@@ -892,6 +970,7 @@ def janitor_sweep() -> int:
 
     return deleted
 
+
 def touch_activity(workspace_id: str) -> None:
     now = _now()
 
@@ -903,6 +982,7 @@ def touch_activity(workspace_id: str) -> None:
     d = CHROMA_ROOT / workspace_id
     if d.exists():
         write_workspace_meta(d, st.session_state.created_at, st.session_state.last_activity)
+
 
 # ============================
 # VECTOR STORE
@@ -917,6 +997,7 @@ def workspace_dir(workspace_id: str) -> Path:
 
     return d
 
+
 def get_vectordb(workspace_id: str) -> Chroma:
     d = workspace_dir(workspace_id)
     collection = f"demo_docs_{workspace_id[:12]}"
@@ -926,6 +1007,7 @@ def get_vectordb(workspace_id: str) -> Chroma:
         embedding_function=get_embeddings(),
     )
 
+
 def reset_workspace() -> None:
     t = uuid.uuid4().hex
     sig = sign_token(t)
@@ -934,27 +1016,51 @@ def reset_workspace() -> None:
     st.session_state.indexed = False
     st.session_state.last_index_count = 0
     st.session_state.messages = []
+    st.session_state.failed_files = []
+    st.session_state.processed_files = []
     st.session_state.created_at = _now()
     st.session_state.last_activity = _now()
+
 
 def index_files(workspace_id: str, files) -> int:
     vectordb = get_vectordb(workspace_id)
     docs: List[Document] = []
     splitter = get_splitter()
 
+    failed_files: List[str] = []
+    processed_files: List[str] = []
+
     for f in files:
-        text = file_to_text(f)
-        if not text.strip():
+        try:
+            text = file_to_text(f)
+        except Exception as e:
+            failed_files.append(f"{f.name}: {type(e).__name__}: {e}")
             continue
 
-        chunks = splitter.split_text(text)
+        if not text.strip():
+            failed_files.append(f"{f.name}: no extractable text found")
+            continue
+
+        processed_files.append(f.name)
+
+        try:
+            chunks = splitter.split_text(text)
+        except Exception as e:
+            failed_files.append(f"{f.name}: chunking failed: {e}")
+            continue
+
         for i, chunk in enumerate(chunks):
+            chunk = (chunk or "").strip()
+            if not chunk:
+                continue
+
             docs.append(
                 Document(
                     page_content=chunk,
                     metadata={"source": f.name, "chunk": i},
                 )
             )
+
             if len(docs) >= MAX_TOTAL_CHUNKS:
                 break
 
@@ -966,8 +1072,11 @@ def index_files(workspace_id: str, files) -> int:
 
     st.session_state.indexed = True
     st.session_state.last_index_count = len(docs)
+    st.session_state.failed_files = failed_files
+    st.session_state.processed_files = processed_files
     touch_activity(workspace_id)
     return len(docs)
+
 
 # ============================
 # RAG ANSWER
@@ -980,6 +1089,7 @@ def safe_json_load(s: str) -> Dict[str, Any]:
     except Exception:
         pass
     return {"answer": s.strip()}
+
 
 def build_context(docs: List[Document], max_chars: int) -> str:
     parts: List[str] = []
@@ -999,6 +1109,7 @@ def build_context(docs: List[Document], max_chars: int) -> str:
         used += part_len + 2
 
     return "\n\n".join(parts)
+
 
 def rag_answer(workspace_id: str, question: str) -> str:
     vectordb = get_vectordb(workspace_id)
@@ -1023,6 +1134,7 @@ Question: {question}
     touch_activity(workspace_id)
     return answer
 
+
 # ============================
 # STREAMLIT APP
 # ============================
@@ -1038,6 +1150,10 @@ def main():
         st.session_state.messages = []
     if "indexed" not in st.session_state:
         st.session_state.indexed = False
+    if "failed_files" not in st.session_state:
+        st.session_state.failed_files = []
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = []
     if "created_at" not in st.session_state:
         st.session_state.created_at = _now()
     if "last_activity" not in st.session_state:
@@ -1086,8 +1202,12 @@ def main():
                     st.warning(
                         "I couldn’t extract text from those files. Supported examples include PDF, DOC/DOCX, PPT/PPTX, ODT/ODS/ODP, TXT, CSV, XLS/XLSX/XLSB, Parquet, HTML, XML, YAML, JSON, JSONL, NDJSON, IPYNB, EML, MSG, RTF, RST, TEX, and code/text files."
                     )
+                    if st.session_state.get("failed_files"):
+                        st.error("Files that failed:\n\n" + "\n".join(f"- {x}" for x in st.session_state["failed_files"]))
                 else:
-                    st.success("Ready. Ask your questions below.")
+                    st.success(f"Ready. Indexed {n} chunks from {len(st.session_state.get('processed_files', []))} file(s).")
+                    if st.session_state.get("failed_files"):
+                        st.warning("Some files could not be processed:\n\n" + "\n".join(f"- {x}" for x in st.session_state["failed_files"]))
                     st.rerun()
 
         st.markdown(
@@ -1103,10 +1223,21 @@ Questions or custom deployments: <strong>linkedin.com/in/thedannyscott</strong>
         return
 
     top = st.columns([3, 1])
+    with top[0]:
+        processed = st.session_state.get("processed_files", [])
+        failed = st.session_state.get("failed_files", [])
+        st.markdown(
+            f'<div class="small-success">Indexed files: {len(processed)} • Failed files: {len(failed)} • Chunks: {st.session_state.get("last_index_count", 0)}</div>',
+            unsafe_allow_html=True,
+        )
     with top[1]:
         if st.button("Reset / New Upload", use_container_width=True):
             reset_workspace()
             st.rerun()
+
+    if st.session_state.get("failed_files"):
+        with st.expander("Show file processing issues"):
+            st.write("\n".join(st.session_state["failed_files"]))
 
     for m in st.session_state.messages:
         avatar = ASSISTANT_AVATAR if m["role"] == "assistant" else None
@@ -1123,6 +1254,7 @@ Questions or custom deployments: <strong>linkedin.com/in/thedannyscott</strong>
             st.markdown(answer)
 
         st.session_state.messages.append({"role": "assistant", "content": answer})
+
 
 if __name__ == "__main__":
     main()
