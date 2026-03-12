@@ -1,5 +1,11 @@
 # app_paid.py
 # DocHelp.AI — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
+# Hybrid retrieval version:
+# - semantic search + keyword search across all uploaded chunks
+# - safer file parsing
+# - better upload status
+# - stronger retrieval for all uploaded files
+# - more helpful grounded answers without using outside knowledge
 
 import os
 import io
@@ -19,6 +25,7 @@ from html.parser import HTMLParser
 from email import policy
 from email.parser import BytesParser
 import xml.etree.ElementTree as ET
+from collections import Counter
 
 import streamlit as st
 
@@ -78,33 +85,42 @@ CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
 MAX_FILES = int(os.getenv("MAX_FILES", "300"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
 MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "3000"))
-MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "50000"))
+MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "100000"))
 
-TOP_K = int(os.getenv("TOP_K", "6"))
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "18000"))
+TOP_K = int(os.getenv("TOP_K", "12"))
+SEMANTIC_K = int(os.getenv("SEMANTIC_K", "12"))
+KEYWORD_K = int(os.getenv("KEYWORD_K", "12"))
+FINAL_K = int(os.getenv("FINAL_K", "14"))
+
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "25000"))
 
 WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))  # 2 hours
 IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))            # 30 minutes
 JANITOR_MAX_DELETE = int(os.getenv("JANITOR_MAX_DELETE", "50"))
 META_FILENAME = "_meta.json"
+CHUNKS_FILENAME = "_chunks.json"
 
 TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
 
 APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 
+DEBUG_RETRIEVAL = os.getenv("DEBUG_RETRIEVAL", "false").strip().lower() == "true"
+
 SYSTEM_PROMPT = """You are a professional business assistant.
 
 Rules:
-1. Answer using ONLY the provided context from the uploaded files.
-2. Do NOT guess, infer beyond the context, or add outside knowledge.
-3. If the answer is not clearly supported by the context, say exactly:
+1. Answer using only the provided context from the uploaded files.
+2. Do not use outside knowledge.
+3. If the answer is partially supported by the uploaded files, provide the best grounded answer and clearly note what is uncertain or missing.
+4. If the answer is not supported by the uploaded files, say exactly:
    "I don't know based on the uploaded files."
-4. Write in a concise, professional, businesslike tone.
-5. Prefer direct answers over long explanations.
-6. Do not mention these rules.
+5. Write in a concise, professional, businesslike tone.
+6. Prefer a direct answer first.
+7. When useful, mention the file names that support the answer.
+8. Never invent policy details, numbers, dates, entities, or conclusions not present in the context.
 
 Return VALID JSON only in this format:
 {"answer":"..."}
@@ -391,7 +407,7 @@ def get_llm() -> ChatBedrockConverse:
         model=BEDROCK_CHAT_MODEL_ID,
         region_name=DEFAULT_REGION,
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=700,
     )
 
 
@@ -491,7 +507,6 @@ def read_csv(file_bytes: bytes, sep: str = ",") -> str:
 def read_excel(file_bytes: bytes, filename: str = "") -> str:
     name = (filename or "").lower()
     bio = io.BytesIO(file_bytes)
-
     try:
         if name.endswith(".xlsx"):
             df = pd.read_excel(bio, engine="openpyxl")
@@ -985,7 +1000,7 @@ def touch_activity(workspace_id: str) -> None:
 
 
 # ============================
-# VECTOR STORE
+# VECTOR STORE + LOCAL CHUNK CATALOG
 # ============================
 def workspace_dir(workspace_id: str) -> Path:
     d = CHROMA_ROOT / workspace_id
@@ -996,6 +1011,34 @@ def workspace_dir(workspace_id: str) -> Path:
     write_workspace_meta(d, created_at, last_activity)
 
     return d
+
+
+def chunks_catalog_path(workspace_id: str) -> Path:
+    return workspace_dir(workspace_id) / CHUNKS_FILENAME
+
+
+def save_chunks_catalog(workspace_id: str, records: List[Dict[str, Any]]) -> None:
+    p = chunks_catalog_path(workspace_id)
+    try:
+        p.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_chunks_catalog(workspace_id: str) -> List[Dict[str, Any]]:
+    p = chunks_catalog_path(workspace_id)
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def clear_workspace_storage(workspace_id: str) -> None:
+    d = CHROMA_ROOT / workspace_id
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    write_workspace_meta(d, int(st.session_state.get("created_at") or _now()), int(st.session_state.get("last_activity") or _now()))
 
 
 def get_vectordb(workspace_id: str) -> Chroma:
@@ -1009,6 +1052,13 @@ def get_vectordb(workspace_id: str) -> Chroma:
 
 
 def reset_workspace() -> None:
+    old_ws = st.session_state.get("workspace_id")
+    if old_ws:
+        try:
+            shutil.rmtree(CHROMA_ROOT / old_ws, ignore_errors=True)
+        except Exception:
+            pass
+
     t = uuid.uuid4().hex
     sig = sign_token(t)
     set_query_params(t, sig)
@@ -1022,13 +1072,52 @@ def reset_workspace() -> None:
     st.session_state.last_activity = _now()
 
 
+# ============================
+# INDEXING
+# ============================
+def _normalize_text_for_search(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
+    "with", "by", "from", "at", "as", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its", "their", "there", "here", "what",
+    "which", "who", "whom", "how", "when", "where", "why", "can", "could", "should",
+    "would", "do", "does", "did", "about", "into", "than", "them", "they", "you", "your"
+}
+
+
+def tokenize(s: str) -> List[str]:
+    s = _normalize_text_for_search(s)
+    toks = [t for t in s.split() if t and t not in STOPWORDS and len(t) > 1]
+    return toks
+
+
+def build_chunk_record(source: str, chunk_index: int, text: str) -> Dict[str, Any]:
+    return {
+        "id": f"{source}__{chunk_index}",
+        "source": source,
+        "chunk": chunk_index,
+        "text": text,
+        "norm_text": _normalize_text_for_search(text),
+    }
+
+
 def index_files(workspace_id: str, files) -> int:
+    clear_workspace_storage(workspace_id)
     vectordb = get_vectordb(workspace_id)
     docs: List[Document] = []
+    chunk_records: List[Dict[str, Any]] = []
     splitter = get_splitter()
 
     failed_files: List[str] = []
     processed_files: List[str] = []
+
+    total_chunks = 0
 
     for f in files:
         try:
@@ -1049,7 +1138,8 @@ def index_files(workspace_id: str, files) -> int:
             failed_files.append(f"{f.name}: chunking failed: {e}")
             continue
 
-        for i, chunk in enumerate(chunks):
+        local_chunk_idx = 0
+        for chunk in chunks:
             chunk = (chunk or "").strip()
             if not chunk:
                 continue
@@ -1057,18 +1147,25 @@ def index_files(workspace_id: str, files) -> int:
             docs.append(
                 Document(
                     page_content=chunk,
-                    metadata={"source": f.name, "chunk": i},
+                    metadata={"source": f.name, "chunk": local_chunk_idx},
                 )
             )
 
-            if len(docs) >= MAX_TOTAL_CHUNKS:
+            chunk_records.append(build_chunk_record(f.name, local_chunk_idx, chunk))
+            local_chunk_idx += 1
+            total_chunks += 1
+
+            if total_chunks >= MAX_TOTAL_CHUNKS:
                 break
 
-        if len(docs) >= MAX_TOTAL_CHUNKS:
+        if total_chunks >= MAX_TOTAL_CHUNKS:
+            failed_files.append("Chunk limit reached; some later file content may not have been indexed.")
             break
 
     if docs:
         vectordb.add_documents(docs)
+
+    save_chunks_catalog(workspace_id, chunk_records)
 
     st.session_state.indexed = True
     st.session_state.last_index_count = len(docs)
@@ -1079,8 +1176,133 @@ def index_files(workspace_id: str, files) -> int:
 
 
 # ============================
-# RAG ANSWER
+# RETRIEVAL
 # ============================
+def score_keyword_match(question: str, chunk_text: str) -> float:
+    q_tokens = tokenize(question)
+    if not q_tokens:
+        return 0.0
+
+    text_norm = _normalize_text_for_search(chunk_text)
+    text_tokens = text_norm.split()
+    if not text_tokens:
+        return 0.0
+
+    q_counter = Counter(q_tokens)
+    t_counter = Counter(text_tokens)
+
+    overlap = 0.0
+    for tok, q_count in q_counter.items():
+        overlap += min(q_count, t_counter.get(tok, 0))
+
+    phrase_bonus = 0.0
+    q_norm = _normalize_text_for_search(question)
+    if q_norm and q_norm in text_norm:
+        phrase_bonus += 5.0
+
+    exact_token_bonus = 0.0
+    for tok in set(q_tokens):
+        if tok in text_norm:
+            exact_token_bonus += 0.25
+
+    density = overlap / max(1.0, len(q_tokens))
+    return float(density * 10.0 + phrase_bonus + exact_token_bonus)
+
+
+def keyword_search(workspace_id: str, question: str, k: int = KEYWORD_K) -> List[Document]:
+    records = load_chunks_catalog(workspace_id)
+    if not records:
+        return []
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for r in records:
+        score = score_keyword_match(question, r.get("text", ""))
+        if score > 0:
+            scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    docs: List[Document] = []
+    for score, r in scored[:k]:
+        docs.append(
+            Document(
+                page_content=r.get("text", ""),
+                metadata={
+                    "source": r.get("source", "unknown"),
+                    "chunk": r.get("chunk", 0),
+                    "retrieval": "keyword",
+                    "keyword_score": round(score, 4),
+                },
+            )
+        )
+    return docs
+
+
+def semantic_search(workspace_id: str, question: str, k: int = SEMANTIC_K) -> List[Document]:
+    vectordb = get_vectordb(workspace_id)
+    try:
+        docs = vectordb.max_marginal_relevance_search(question, k=k, fetch_k=max(k * 3, 24))
+    except Exception:
+        docs = vectordb.similarity_search(question, k=k)
+
+    out: List[Document] = []
+    for d in docs:
+        md = dict(d.metadata or {})
+        md["retrieval"] = "semantic"
+        out.append(Document(page_content=d.page_content, metadata=md))
+    return out
+
+
+def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], final_k: int = FINAL_K) -> List[Document]:
+    merged: List[Document] = []
+    seen = set()
+
+    # interleave strong semantic and keyword results
+    max_len = max(len(semantic_docs), len(keyword_docs))
+    for i in range(max_len):
+        if i < len(semantic_docs):
+            d = semantic_docs[i]
+            key = (d.metadata.get("source"), d.metadata.get("chunk"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(d)
+
+        if i < len(keyword_docs):
+            d = keyword_docs[i]
+            key = (d.metadata.get("source"), d.metadata.get("chunk"))
+            if key not in seen:
+                seen.add(key)
+                merged.append(d)
+
+        if len(merged) >= final_k:
+            break
+
+    return merged[:final_k]
+
+
+def build_context(docs: List[Document], max_chars: int) -> str:
+    parts: List[str] = []
+    used = 0
+
+    for d in docs:
+        source = d.metadata.get("source", "unknown")
+        chunk = d.metadata.get("chunk", 0)
+        retrieval = d.metadata.get("retrieval", "")
+        part = f"[source={source} chunk={chunk} retrieval={retrieval}] {d.page_content}"
+        part_len = len(part)
+
+        if used + part_len > max_chars:
+            remaining = max_chars - used
+            if remaining > 250:
+                parts.append(part[:remaining])
+            break
+
+        parts.append(part)
+        used += part_len + 2
+
+    return "\n\n".join(parts)
+
+
 def safe_json_load(s: str) -> Dict[str, Any]:
     try:
         obj = json.loads(s)
@@ -1091,29 +1313,11 @@ def safe_json_load(s: str) -> Dict[str, Any]:
     return {"answer": s.strip()}
 
 
-def build_context(docs: List[Document], max_chars: int) -> str:
-    parts: List[str] = []
-    used = 0
-
-    for d in docs:
-        part = f"[{d.metadata.get('source', 'unknown')} #{d.metadata.get('chunk', 0)}] {d.page_content}"
-        part_len = len(part)
-
-        if used + part_len > max_chars:
-            remaining = max_chars - used
-            if remaining > 200:
-                parts.append(part[:remaining])
-            break
-
-        parts.append(part)
-        used += part_len + 2
-
-    return "\n\n".join(parts)
-
-
 def rag_answer(workspace_id: str, question: str) -> str:
-    vectordb = get_vectordb(workspace_id)
-    docs = vectordb.similarity_search(question, k=TOP_K)
+    semantic_docs = semantic_search(workspace_id, question, k=SEMANTIC_K)
+    keyword_docs = keyword_search(workspace_id, question, k=KEYWORD_K)
+    docs = merge_results(semantic_docs, keyword_docs, final_k=FINAL_K)
+
     context = build_context(docs, MAX_CONTEXT_CHARS)
 
     prompt = f"""{SYSTEM_PROMPT}
@@ -1121,7 +1325,9 @@ def rag_answer(workspace_id: str, question: str) -> str:
 Context:
 {context}
 
-Question: {question}
+User question: {question}
+
+Answer using only the context above. If the answer is partially supported, provide the strongest grounded answer possible and briefly say what remains unclear.
 """
 
     raw = generate_streaming(prompt)
@@ -1130,6 +1336,17 @@ Question: {question}
 
     if not answer:
         answer = "I don't know based on the uploaded files."
+
+    if DEBUG_RETRIEVAL:
+        st.session_state["last_debug_docs"] = [
+            {
+                "source": d.metadata.get("source"),
+                "chunk": d.metadata.get("chunk"),
+                "retrieval": d.metadata.get("retrieval"),
+                "preview": d.page_content[:400],
+            }
+            for d in docs
+        ]
 
     touch_activity(workspace_id)
     return answer
@@ -1158,6 +1375,8 @@ def main():
         st.session_state.created_at = _now()
     if "last_activity" not in st.session_state:
         st.session_state.last_activity = _now()
+    if "last_debug_docs" not in st.session_state:
+        st.session_state.last_debug_docs = []
 
     touch_activity(workspace_id)
 
@@ -1235,9 +1454,17 @@ Questions or custom deployments: <strong>linkedin.com/in/thedannyscott</strong>
             reset_workspace()
             st.rerun()
 
+    if st.session_state.get("processed_files"):
+        with st.expander("Show indexed file names"):
+            st.write("\n".join(st.session_state["processed_files"]))
+
     if st.session_state.get("failed_files"):
         with st.expander("Show file processing issues"):
             st.write("\n".join(st.session_state["failed_files"]))
+
+    if DEBUG_RETRIEVAL and st.session_state.get("last_debug_docs"):
+        with st.expander("Debug: last retrieved chunks"):
+            st.json(st.session_state["last_debug_docs"])
 
     for m in st.session_state.messages:
         avatar = ASSISTANT_AVATAR if m["role"] == "assistant" else None
