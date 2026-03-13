@@ -1,23 +1,15 @@
-# app_paid_DEV.py
-# DocHelp.AI — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
-# Hybrid retrieval version:
-# - semantic search + keyword search across all uploaded chunks
-# - safer file parsing
-# - better upload status
-# - stronger retrieval for all uploaded files
-# - more helpful grounded answers without using outside knowledge
-
 import os
 import io
 import re
 import json
 import uuid
 import time
-import shutil
 import hmac
+import yaml
 import hashlib
-import configparser
 import zipfile
+import configparser
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib.parse import unquote, quote
@@ -25,10 +17,19 @@ from html.parser import HTMLParser
 from email import policy
 from email.parser import BytesParser
 from datetime import datetime
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
-from collections import Counter
 
 import streamlit as st
+import pandas as pd
+from pypdf import PdfReader
+from docx import Document as DocxDocument
+from pptx import Presentation
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_chroma import Chroma
+from langchain_aws import ChatBedrockConverse, BedrockEmbeddings
 
 # Load .env locally only (never override Streamlit Cloud secrets)
 try:
@@ -38,17 +39,6 @@ try:
         load_dotenv(override=False)
 except Exception:
     pass
-
-# Core deps
-import pandas as pd
-import yaml
-from pypdf import PdfReader
-from docx import Document as DocxDocument
-from pptx import Presentation
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_chroma import Chroma
-from langchain_aws import ChatBedrockConverse, BedrockEmbeddings
 
 # Optional parsers
 try:
@@ -72,7 +62,6 @@ except Exception:
 # ============================
 APP_TITLE = "DocHelp.AI"
 BRAND_PINK = "#1F4ED8"
-
 DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-2").strip()
 
 BEDROCK_CHAT_MODEL_ID = unquote(
@@ -82,47 +71,29 @@ BEDROCK_EMBED_MODEL_ID = unquote(
     os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0").strip()
 )
 
-
-def default_app_data_root() -> Path:
-    env_root = os.getenv("DOCHELP_DATA_ROOT", "").strip()
-    if env_root:
-        return Path(env_root).expanduser().resolve()
-    return (Path.home() / ".dochelp_ai").resolve()
-
-
-APP_DATA_ROOT = default_app_data_root()
-CHROMA_ROOT = APP_DATA_ROOT / "chroma"
+TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
+APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 
 MAX_FILES = int(os.getenv("MAX_FILES", "300"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
 MAX_TOTAL_UPLOAD_MB = int(os.getenv("MAX_TOTAL_UPLOAD_MB", "3000"))
 MAX_TOTAL_CHUNKS = int(os.getenv("MAX_TOTAL_CHUNKS", "100000"))
 
-TOP_K = int(os.getenv("TOP_K", "12"))
-SEMANTIC_K = int(os.getenv("SEMANTIC_K", "12"))
-KEYWORD_K = int(os.getenv("KEYWORD_K", "12"))
-FINAL_K = int(os.getenv("FINAL_K", "14"))
-
-SEMANTIC_K_PER_QUERY = int(os.getenv("SEMANTIC_K_PER_QUERY", str(SEMANTIC_K)))
-KEYWORD_K_PER_QUERY = int(os.getenv("KEYWORD_K_PER_QUERY", str(KEYWORD_K)))
+SEMANTIC_K = int(os.getenv("SEMANTIC_K", "10"))
+KEYWORD_K = int(os.getenv("KEYWORD_K", "10"))
+FINAL_K = int(os.getenv("FINAL_K", "12"))
 ADJACENT_CHUNKS = int(os.getenv("ADJACENT_CHUNKS", "1"))
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "25000"))
-
-WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))  # 2 hours
-IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))  # 30 minutes
-JANITOR_MAX_DELETE = int(os.getenv("JANITOR_MAX_DELETE", "50"))
-META_FILENAME = "_meta.json"
-MANIFEST_FILENAME = "_manifest.json"
-
-TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
-
-APP_USERNAME = os.getenv("APP_USERNAME", "").strip()
-APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
-
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "22000"))
+MAX_PARSE_WORKERS = int(os.getenv("MAX_PARSE_WORKERS", "6"))
+ENABLE_QUERY_REWRITE = os.getenv("ENABLE_QUERY_REWRITE", "false").strip().lower() == "true"
 DEBUG_RETRIEVAL = os.getenv("DEBUG_RETRIEVAL", "false").strip().lower() == "true"
+
+WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))
+IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))
 
 SYSTEM_PROMPT = """You are a professional business assistant.
 
@@ -131,7 +102,7 @@ Rules:
 2. Do not use outside knowledge.
 3. If the answer is partially supported by the uploaded files, provide the best grounded answer and clearly note what is uncertain or missing.
 4. If the answer is not supported by the uploaded files, say exactly:
-   "I don't know based on the uploaded files."
+   \"I don't know based on the uploaded files.\"
 5. Write in a concise, professional, businesslike tone.
 6. Prefer a direct answer first.
 7. When useful, mention the file names that support the answer.
@@ -155,11 +126,22 @@ Rules:
 {"queries":["q1","q2","q3"]}
 """
 
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
+    "with", "by", "from", "at", "as", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its", "their", "there", "here", "what",
+    "which", "who", "whom", "how", "when", "where", "why", "can", "could", "should",
+    "would", "do", "does", "did", "about", "into", "than", "them", "they", "you", "your",
+    "me", "my", "we", "our", "please", "show", "tell", "give"
+}
+
+_PARSE_LOCKS: Dict[str, threading.Lock] = {}
+
 
 # ============================
 # UI / STYLES
 # ============================
-def inject_styles():
+def inject_styles() -> None:
     st.markdown(
         f"""
 <style>
@@ -382,23 +364,23 @@ def get_query_params() -> Dict[str, str]:
 
 def ensure_tenant_context() -> str:
     qp = get_query_params()
-    t = (qp.get("t") or "").strip()
+    token = (qp.get("t") or "").strip()
     sig = (qp.get("sig") or "").strip()
 
     valid = False
     try:
-        valid = verify_token(t, sig)
+        valid = verify_token(token, sig)
     except Exception:
         valid = False
 
     if not valid:
-        t = uuid.uuid4().hex
-        sig = sign_token(t)
-        set_query_params(t, sig)
+        token = uuid.uuid4().hex
+        sig = sign_token(token)
+        set_query_params(token, sig)
 
-    ws = workspace_id_from_token(t)
-    st.session_state["workspace_id"] = ws
-    return ws
+    workspace_id = workspace_id_from_token(token)
+    st.session_state["workspace_id"] = workspace_id
+    return workspace_id
 
 
 # ============================
@@ -450,6 +432,93 @@ def get_llm() -> ChatBedrockConverse:
         temperature=0.0,
         max_tokens=700,
     )
+
+
+# ============================
+# SESSION INDEX STORAGE
+# ============================
+def _now() -> int:
+    return int(time.time())
+
+
+def utc_stamp() -> str:
+    return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+
+
+def ensure_workspace_state(workspace_id: str) -> Dict[str, Any]:
+    key = f"index_data::{workspace_id}"
+    if key not in st.session_state:
+        st.session_state[key] = {
+            "files": [],
+            "chunks": [],
+            "chunk_lookup": {},
+            "inverted_index": defaultdict(set),
+            "file_hashes": set(),
+            "created_at": _now(),
+            "last_activity": _now(),
+        }
+    return st.session_state[key]
+
+
+def touch_activity(workspace_id: str) -> None:
+    data = ensure_workspace_state(workspace_id)
+    data["last_activity"] = _now()
+    st.session_state["last_activity"] = data["last_activity"]
+    st.session_state.setdefault("created_at", data.get("created_at", _now()))
+
+
+def workspace_expired(workspace_id: str) -> bool:
+    data = ensure_workspace_state(workspace_id)
+    created_at = int(data.get("created_at") or _now())
+    last_activity = int(data.get("last_activity") or _now())
+    now = _now()
+    return (now - created_at) > WORKSPACE_TTL_SECONDS or (now - last_activity) > IDLE_TTL_SECONDS
+
+
+def clear_workspace_storage(workspace_id: str) -> None:
+    ensure_workspace_state(workspace_id)
+    st.session_state[f"index_data::{workspace_id}"] = {
+        "files": [],
+        "chunks": [],
+        "chunk_lookup": {},
+        "inverted_index": defaultdict(set),
+        "file_hashes": set(),
+        "created_at": _now(),
+        "last_activity": _now(),
+    }
+    st.session_state[f"vectordb::{workspace_id}"] = Chroma(
+        collection_name=f"demo_docs_{workspace_id[:12]}_{utc_stamp()}",
+        embedding_function=get_embeddings(),
+    )
+
+
+def get_index_data(workspace_id: str) -> Dict[str, Any]:
+    return ensure_workspace_state(workspace_id)
+
+
+def get_vectordb(workspace_id: str) -> Chroma:
+    key = f"vectordb::{workspace_id}"
+    if key not in st.session_state:
+        st.session_state[key] = Chroma(
+            collection_name=f"demo_docs_{workspace_id[:12]}",
+            embedding_function=get_embeddings(),
+        )
+    return st.session_state[key]
+
+
+def reset_workspace() -> None:
+    token = uuid.uuid4().hex
+    sig = sign_token(token)
+    set_query_params(token, sig)
+
+    st.session_state.indexed = False
+    st.session_state.last_index_count = 0
+    st.session_state.messages = []
+    st.session_state.failed_files = []
+    st.session_state.processed_files = []
+    st.session_state.last_debug_docs = []
+    st.session_state.created_at = _now()
+    st.session_state.last_activity = _now()
 
 
 # ============================
@@ -507,7 +576,20 @@ def safe_json_load(s: str) -> Dict[str, Any]:
     return {"answer": s.strip()}
 
 
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def rewrite_queries(question: str) -> List[str]:
+    if not ENABLE_QUERY_REWRITE:
+        return [question]
+
     prompt = f"""{QUERY_REWRITE_PROMPT}
 
 Original question:
@@ -518,7 +600,7 @@ Original question:
         obj = safe_json_load(raw)
         queries = obj.get("queries", [])
         if isinstance(queries, list):
-            clean = []
+            clean: List[str] = []
             for q in queries:
                 q = str(q or "").strip()
                 if q and q.lower() != question.lower():
@@ -530,7 +612,7 @@ Original question:
 
 
 # ============================
-# FILE PARSING
+# FILE PARSING HELPERS
 # ============================
 class _HTMLTextExtractor(HTMLParser):
     def __init__(self):
@@ -579,8 +661,9 @@ def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             parts: List[str] = []
+            names = set(zf.namelist())
             for name in member_names:
-                if name in zf.namelist():
+                if name in names:
                     xml_text = zf.read(name).decode("utf-8", errors="ignore")
                     cleaned = _strip_xml_tags(xml_text)
                     if cleaned:
@@ -588,15 +671,14 @@ def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
             return _clean_whitespace("\n\n".join(parts))
     except Exception:
         return ""
-    return ""
 
 
 def read_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
     texts: List[str] = []
-    for i, p in enumerate(reader.pages):
+    for i, page in enumerate(reader.pages):
         try:
-            txt = p.extract_text() or ""
+            txt = page.extract_text() or ""
         except Exception:
             txt = ""
         if txt.strip():
@@ -612,7 +694,20 @@ def read_csv(file_bytes: bytes, sep: str = ",") -> str:
             return df.to_csv(index=False)
         except Exception as e:
             last_err = e
-    raise RuntimeError(f"Could not read CSV/TSV/PSV file: {last_err}")
+    raise RuntimeError(f"Could not read delimited file: {last_err}")
+
+
+def _dataframe_to_text(df: pd.DataFrame) -> str:
+    if df is None:
+        return ""
+    if df.empty:
+        cols = [str(c) for c in df.columns]
+        return ",".join(cols) if cols else ""
+
+    rows = min(len(df), 5000)
+    cols = min(len(df.columns), 100)
+    slim = df.iloc[:rows, :cols].copy()
+    return slim.fillna("").to_csv(index=False)
 
 
 def read_excel(file_bytes: bytes, filename: str = "") -> str:
@@ -633,16 +728,10 @@ def read_excel(file_bytes: bytes, filename: str = "") -> str:
         raise RuntimeError(f"Could not read Excel file '{filename}': {e}") from e
 
     parts: List[str] = []
-    if isinstance(sheets, dict):
-        for sheet_name, df in sheets.items():
-            parts.append(f"=== Sheet: {sheet_name} ===")
-            try:
-                parts.append(df.fillna("").to_csv(index=False))
-            except Exception:
-                parts.append(str(df))
-            parts.append("")
-    else:
-        parts.append(str(sheets))
+    for sheet_name, df in (sheets or {}).items():
+        parts.append(f"=== Sheet: {sheet_name} ===")
+        parts.append(_dataframe_to_text(df))
+        parts.append("")
     return _clean_whitespace("\n".join(parts))
 
 
@@ -650,11 +739,10 @@ def read_xlsb(file_bytes: bytes, filename: str = "") -> str:
     try:
         sheets = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb", sheet_name=None)
         parts: List[str] = []
-        if isinstance(sheets, dict):
-            for sheet_name, df in sheets.items():
-                parts.append(f"=== Sheet: {sheet_name} ===")
-                parts.append(df.fillna("").to_csv(index=False))
-                parts.append("")
+        for sheet_name, df in (sheets or {}).items():
+            parts.append(f"=== Sheet: {sheet_name} ===")
+            parts.append(_dataframe_to_text(df))
+            parts.append("")
         return _clean_whitespace("\n".join(parts))
     except ImportError as e:
         raise RuntimeError(
@@ -667,7 +755,7 @@ def read_xlsb(file_bytes: bytes, filename: str = "") -> str:
 def read_parquet(file_bytes: bytes, filename: str = "") -> str:
     try:
         df = pd.read_parquet(io.BytesIO(file_bytes))
-        return df.fillna("").to_csv(index=False)
+        return _dataframe_to_text(df)
     except Exception as e:
         raise RuntimeError(f"Could not read Parquet file '{filename}': {e}") from e
 
@@ -731,8 +819,8 @@ def read_xml(file_bytes: bytes) -> str:
                 parts.append(elem.tail.strip())
         return _clean_whitespace("\n".join(parts))
     except Exception:
-        xml = _decode_best_effort(file_bytes)
-        return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml))
+        xml_text = _decode_best_effort(file_bytes)
+        return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml_text))
 
 
 def read_html(file_bytes: bytes) -> str:
@@ -888,12 +976,9 @@ def read_ipynb(file_bytes: bytes) -> str:
         nb = json.loads(_decode_best_effort(file_bytes))
         cells = nb.get("cells", []) if isinstance(nb, dict) else []
         parts: List[str] = []
-        for c in cells:
-            src = c.get("source", [])
-            if isinstance(src, list):
-                s = "".join(src)
-            else:
-                s = str(src or "")
+        for cell in cells:
+            src = cell.get("source", [])
+            s = "".join(src) if isinstance(src, list) else str(src or "")
             if s.strip():
                 parts.append(s.strip())
         return _clean_whitespace("\n\n".join(parts))
@@ -980,24 +1065,20 @@ def file_to_text(uploaded_file) -> str:
 
     if name.endswith(".pdf"):
         return read_pdf(b)
-
     if name.endswith(".docx"):
         return read_docx(b)
     if name.endswith(".doc"):
         return read_doc_legacy(b)
-
     if name.endswith(".pptx"):
         return read_pptx(b)
     if name.endswith(".ppt"):
         return read_ppt_legacy(b)
-
     if name.endswith(".odt"):
         return read_odt(b)
     if name.endswith(".ods"):
         return read_ods(b)
     if name.endswith(".odp"):
         return read_odp(b)
-
     if name.endswith(".csv"):
         return read_csv(b, sep=",")
     if name.endswith(".tsv"):
@@ -1010,7 +1091,6 @@ def file_to_text(uploaded_file) -> str:
         return read_excel(b, name)
     if name.endswith(".parquet"):
         return read_parquet(b, name)
-
     if name.endswith((".html", ".htm")):
         return read_html(b)
     if name.endswith(".xml"):
@@ -1019,7 +1099,6 @@ def file_to_text(uploaded_file) -> str:
         return read_yaml(b)
     if name.endswith((".ini", ".cfg", ".conf")):
         return read_ini(b)
-
     if name.endswith(".ipynb"):
         return read_ipynb(b)
     if name.endswith(".eml"):
@@ -1028,18 +1107,32 @@ def file_to_text(uploaded_file) -> str:
         return read_msg(b)
     if name.endswith(".rtf"):
         return read_rtf(b)
-
     if name.endswith(".json"):
         return read_json(b)
     if name.endswith((".jsonl", ".ndjson")):
         return read_jsonl(b)
-
     if name.endswith(CODE_EXTS) or name.endswith(TEXTY_EXTS):
         return read_txt(b)
-
     return ""
 
 
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=512)
+def parse_file_cached(file_name: str, file_bytes: bytes) -> str:
+    class UploadedShim:
+        def __init__(self, name: str, data: bytes):
+            self.name = name
+            self._data = data
+
+        def getvalue(self):
+            return self._data
+
+    shim = UploadedShim(file_name, file_bytes)
+    return file_to_text(shim)
+
+
+# ============================
+# VALIDATION / INDEX HELPERS
+# ============================
 def validate_uploads(files) -> Tuple[bool, str]:
     if not files:
         return False, "Please upload at least one file."
@@ -1051,7 +1144,6 @@ def validate_uploads(files) -> Tuple[bool, str]:
     for f in files:
         size_bytes = int(getattr(f, "size", 0) or 0)
         total_bytes += size_bytes
-
         size_mb = size_bytes / (1024 * 1024)
         if size_mb > MAX_FILE_MB:
             return False, f"File '{f.name}' is too large ({size_mb:.1f} MB). Max is {MAX_FILE_MB} MB."
@@ -1063,245 +1155,6 @@ def validate_uploads(files) -> Tuple[bool, str]:
     return True, ""
 
 
-# ============================
-# WORKSPACE META + JANITOR
-# ============================
-def _now() -> int:
-    return int(time.time())
-
-
-def utc_stamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
-
-
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def assert_writable_dir(path: Path) -> None:
-    ensure_dir(path)
-    test_file = path / f".write_test_{uuid.uuid4().hex}.tmp"
-    try:
-        test_file.write_text("ok", encoding="utf-8")
-        _ = test_file.read_text(encoding="utf-8")
-    finally:
-        try:
-            if test_file.exists():
-                test_file.unlink()
-        except Exception:
-            pass
-
-
-def safe_rmtree(path: Path) -> None:
-    try:
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
-
-
-def read_workspace_meta(d: Path) -> Dict[str, Any]:
-    p = d / META_FILENAME
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def write_workspace_meta(d: Path, created_at: int, last_activity: int) -> None:
-    ensure_dir(d)
-    p = d / META_FILENAME
-    meta = {"created_at": int(created_at), "last_activity": int(last_activity)}
-    try:
-        p.write_text(json.dumps(meta), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def get_workspace_db_version() -> str:
-    version = st.session_state.get("db_version")
-    if not version:
-        version = utc_stamp()
-        st.session_state["db_version"] = version
-    return version
-
-
-def bump_workspace_db_version() -> str:
-    version = utc_stamp()
-    st.session_state["db_version"] = version
-    return version
-
-
-def workspace_base_dir(workspace_id: str) -> Path:
-    return ensure_dir(CHROMA_ROOT / workspace_id)
-
-
-def workspace_meta_dir(workspace_id: str) -> Path:
-    d = workspace_base_dir(workspace_id) / "meta"
-    ensure_dir(d)
-    assert_writable_dir(d)
-    return d
-
-
-def workspace_db_dir(workspace_id: str) -> Path:
-    d = workspace_base_dir(workspace_id) / f"db_{get_workspace_db_version()}"
-    ensure_dir(d)
-    assert_writable_dir(d)
-    return d
-
-
-def janitor_sweep() -> int:
-    if not CHROMA_ROOT.exists():
-        return 0
-
-    now = _now()
-    deleted = 0
-
-    for ws_dir in CHROMA_ROOT.iterdir():
-        if not ws_dir.is_dir():
-            continue
-
-        meta_dir = ws_dir / "meta"
-        meta = read_workspace_meta(meta_dir) if meta_dir.exists() else {}
-        created_at = int(meta.get("created_at") or 0)
-        last_activity = int(meta.get("last_activity") or 0)
-        mtime = int(ws_dir.stat().st_mtime)
-
-        if created_at <= 0:
-            created_at = mtime
-        if last_activity <= 0:
-            last_activity = mtime
-
-        if (now - created_at) > WORKSPACE_TTL_SECONDS or (now - last_activity) > IDLE_TTL_SECONDS:
-            safe_rmtree(ws_dir)
-            deleted += 1
-
-        if deleted >= JANITOR_MAX_DELETE:
-            break
-
-    return deleted
-
-
-def touch_activity(workspace_id: str) -> None:
-    now = _now()
-
-    if "created_at" not in st.session_state:
-        st.session_state.created_at = now
-
-    st.session_state.last_activity = now
-    write_workspace_meta(
-        workspace_meta_dir(workspace_id),
-        st.session_state.created_at,
-        st.session_state.last_activity,
-    )
-
-
-# ============================
-# VECTOR STORE + LOCAL CHUNK CATALOG
-# ============================
-def workspace_dir(workspace_id: str) -> Path:
-    d = workspace_meta_dir(workspace_id)
-    created_at = int(st.session_state.get("created_at") or _now())
-    last_activity = int(st.session_state.get("last_activity") or _now())
-    write_workspace_meta(d, created_at, last_activity)
-    return d
-
-
-def manifest_path(workspace_id: str) -> Path:
-    return workspace_meta_dir(workspace_id) / MANIFEST_FILENAME
-
-
-def save_manifest(workspace_id: str, manifest: Dict[str, Any]) -> None:
-    p = manifest_path(workspace_id)
-    ensure_dir(p.parent)
-    assert_writable_dir(p.parent)
-    p.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-
-
-def load_manifest(workspace_id: str) -> Dict[str, Any]:
-    p = manifest_path(workspace_id)
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("files", [])
-            data.setdefault("chunks", [])
-            return data
-    except Exception:
-        pass
-    return {"files": [], "chunks": []}
-
-
-def clear_workspace_storage(workspace_id: str) -> None:
-    bump_workspace_db_version()
-    write_workspace_meta(
-        workspace_meta_dir(workspace_id),
-        int(st.session_state.get("created_at") or _now()),
-        int(st.session_state.get("last_activity") or _now()),
-    )
-    save_manifest(workspace_id, {"files": [], "chunks": []})
-
-
-def get_vectordb(workspace_id: str) -> Chroma:
-    db_dir = workspace_db_dir(workspace_id)
-    collection = f"demo_docs_{workspace_id[:12]}_{get_workspace_db_version()[:12]}"
-    return Chroma(
-        collection_name=collection,
-        persist_directory=str(db_dir),
-        embedding_function=get_embeddings(),
-    )
-
-
-def add_documents_with_retry(workspace_id: str, docs: List[Document], ids: List[str]) -> None:
-    if not docs:
-        return
-
-    last_error = None
-    for attempt in range(2):
-        try:
-            vectordb = get_vectordb(workspace_id)
-            vectordb.add_documents(docs, ids=ids)
-            return
-        except Exception as e:
-            last_error = e
-            if attempt == 0:
-                bump_workspace_db_version()
-                continue
-
-    raise RuntimeError(
-        f"Chroma write failed after retry. Current db dir: {workspace_db_dir(workspace_id)}. Error: {last_error}"
-    ) from last_error
-
-
-def reset_workspace() -> None:
-    t = uuid.uuid4().hex
-    sig = sign_token(t)
-    set_query_params(t, sig)
-
-    st.session_state.indexed = False
-    st.session_state.last_index_count = 0
-    st.session_state.messages = []
-    st.session_state.failed_files = []
-    st.session_state.processed_files = []
-    st.session_state.created_at = _now()
-    st.session_state.last_activity = _now()
-    st.session_state.last_debug_docs = []
-    st.session_state.db_version = utc_stamp()
-
-
-# ============================
-# INDEXING
-# ============================
-STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
-    "with", "by", "from", "at", "as", "is", "are", "was", "were", "be", "been", "being",
-    "this", "that", "these", "those", "it", "its", "their", "there", "here", "what",
-    "which", "who", "whom", "how", "when", "where", "why", "can", "could", "should",
-    "would", "do", "does", "did", "about", "into", "than", "them", "they", "you", "your",
-    "me", "my", "we", "our", "please", "show", "tell", "give"
-}
-
-
 def _normalize_text_for_search(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9\s._/-]", " ", s)
@@ -1311,17 +1164,7 @@ def _normalize_text_for_search(s: str) -> str:
 
 def tokenize(s: str) -> List[str]:
     s = _normalize_text_for_search(s)
-    return [t for t in s.split() if t and t not in STOPWORDS and len(t) > 1]
-
-
-def dedupe_preserve_order(items: List[str]) -> List[str]:
-    out = []
-    seen = set()
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    return [t for t in s.split() if t and t not in _STOPWORDS and len(t) > 1]
 
 
 def file_hash_bytes(file_bytes: bytes) -> str:
@@ -1332,110 +1175,125 @@ def build_chunk_id(file_hash: str, chunk_idx: int) -> str:
     return f"{file_hash}::{chunk_idx}"
 
 
-def get_existing_file_hashes(manifest: Dict[str, Any]) -> set:
-    return {str(f.get("file_hash")) for f in manifest.get("files", []) if f.get("file_hash")}
+def _parse_one_file(uploaded_file) -> Dict[str, Any]:
+    raw_bytes = uploaded_file.getvalue()
+    file_hash = file_hash_bytes(raw_bytes)
+    text = parse_file_cached(uploaded_file.name, raw_bytes)
+    return {
+        "name": uploaded_file.name,
+        "size_bytes": int(getattr(uploaded_file, "size", 0) or 0),
+        "file_hash": file_hash,
+        "text": text,
+    }
+
+
+def _batched(seq: List[Any], batch_size: int) -> List[List[Any]]:
+    return [seq[i:i + batch_size] for i in range(0, len(seq), batch_size)]
 
 
 def index_files(workspace_id: str, files) -> int:
     clear_workspace_storage(workspace_id)
 
-    assert_writable_dir(APP_DATA_ROOT)
-    assert_writable_dir(CHROMA_ROOT)
-    assert_writable_dir(workspace_base_dir(workspace_id))
-    assert_writable_dir(workspace_meta_dir(workspace_id))
-    assert_writable_dir(workspace_db_dir(workspace_id))
-
     splitter = get_splitter()
-    manifest = load_manifest(workspace_id)
+    index_data = get_index_data(workspace_id)
+
     docs: List[Document] = []
     ids: List[str] = []
     failed_files: List[str] = []
     processed_files: List[str] = []
-    existing_hashes = get_existing_file_hashes(manifest)
+    parsed_results: List[Dict[str, Any]] = []
 
+    with ThreadPoolExecutor(max_workers=max(1, MAX_PARSE_WORKERS)) as executor:
+        futures = {executor.submit(_parse_one_file, f): f for f in files}
+        for future in as_completed(futures):
+            file_obj = futures[future]
+            try:
+                parsed_results.append(future.result())
+            except Exception as e:
+                failed_files.append(f"{file_obj.name}: {type(e).__name__}: {e}")
+
+    parsed_results.sort(key=lambda x: x["name"].lower())
     total_chunks = 0
 
-    for f in files:
-        try:
-            raw_bytes = f.getvalue()
-            f_hash = file_hash_bytes(raw_bytes)
-        except Exception as e:
-            failed_files.append(f"{f.name}: could not read uploaded bytes: {e}")
-            continue
+    for item in parsed_results:
+        file_name = item["name"]
+        file_hash = item["file_hash"]
+        text = (item["text"] or "").strip()
 
-        if f_hash in existing_hashes:
-            continue
-
-        try:
-            text = file_to_text(f)
-        except Exception as e:
-            failed_files.append(f"{f.name}: {type(e).__name__}: {e}")
-            continue
-
-        if not text.strip():
-            failed_files.append(f"{f.name}: no extractable text found")
+        if not text:
+            failed_files.append(f"{file_name}: no extractable text found")
             continue
 
         try:
             chunks = splitter.split_text(text)
         except Exception as e:
-            failed_files.append(f"{f.name}: chunking failed: {e}")
+            failed_files.append(f"{file_name}: chunking failed: {e}")
             continue
 
-        clean_chunks = [(chunk or "").strip() for chunk in chunks if (chunk or "").strip()]
+        clean_chunks = [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
         if not clean_chunks:
-            failed_files.append(f"{f.name}: no usable chunks after parsing")
+            failed_files.append(f"{file_name}: no usable chunks after parsing")
             continue
 
         if total_chunks + len(clean_chunks) > MAX_TOTAL_CHUNKS:
             failed_files.append("Chunk limit reached; some later file content may not have been indexed.")
             break
 
-        manifest["files"].append(
+        index_data["files"].append(
             {
-                "file_name": f.name,
-                "file_hash": f_hash,
-                "size_bytes": int(getattr(f, "size", 0) or 0),
+                "file_name": file_name,
+                "file_hash": file_hash,
+                "size_bytes": item["size_bytes"],
                 "chunk_count": len(clean_chunks),
                 "indexed_at": _now(),
             }
         )
 
         for idx, chunk in enumerate(clean_chunks):
-            chunk_id = build_chunk_id(f_hash, idx)
-            manifest["chunks"].append(
-                {
-                    "id": chunk_id,
-                    "source": f.name,
-                    "file_hash": f_hash,
-                    "chunk": idx,
-                    "text": chunk,
-                    "norm_text": _normalize_text_for_search(chunk),
-                }
-            )
+            chunk_id = build_chunk_id(file_hash, idx)
+            record = {
+                "id": chunk_id,
+                "source": file_name,
+                "file_hash": file_hash,
+                "chunk": idx,
+                "text": chunk,
+                "norm_text": _normalize_text_for_search(chunk),
+            }
+            index_data["chunks"].append(record)
+            index_data["chunk_lookup"][(file_hash, idx)] = record
+
+            for tok in set(tokenize(chunk) + tokenize(file_name)):
+                index_data["inverted_index"][tok].add(chunk_id)
+
             docs.append(
                 Document(
                     page_content=chunk,
-                    metadata={"id": chunk_id, "source": f.name, "file_hash": f_hash, "chunk": idx},
+                    metadata={
+                        "id": chunk_id,
+                        "source": file_name,
+                        "file_hash": file_hash,
+                        "chunk": idx,
+                    },
                 )
             )
             ids.append(chunk_id)
             total_chunks += 1
 
-        processed_files.append(f.name)
-        existing_hashes.add(f_hash)
+        processed_files.append(file_name)
+        index_data["file_hashes"].add(file_hash)
 
     if docs:
-        add_documents_with_retry(workspace_id, docs, ids)
+        vectordb = get_vectordb(workspace_id)
+        batch_size = 128
+        for doc_batch, id_batch in zip(_batched(docs, batch_size), _batched(ids, batch_size)):
+            vectordb.add_documents(doc_batch, ids=id_batch)
 
-    save_manifest(workspace_id, manifest)
-
-    st.session_state.indexed = len(manifest.get("chunks", [])) > 0
-    st.session_state.last_index_count = len(manifest.get("chunks", []))
+    st.session_state.indexed = len(index_data["chunks"]) > 0
+    st.session_state.last_index_count = len(index_data["chunks"])
     st.session_state.failed_files = dedupe_preserve_order(failed_files)
     st.session_state.processed_files = dedupe_preserve_order(processed_files)
     touch_activity(workspace_id)
-    return len(manifest.get("chunks", []))
+    return len(index_data["chunks"])
 
 
 # ============================
@@ -1478,29 +1336,44 @@ def score_keyword_match(question: str, chunk_text: str, filename: str = "") -> f
 
 
 def keyword_search(workspace_id: str, question: str, k: int = KEYWORD_K) -> List[Document]:
-    manifest = load_manifest(workspace_id)
-    records = manifest.get("chunks", [])
-    if not records:
+    index_data = get_index_data(workspace_id)
+    chunks = index_data.get("chunks", [])
+    inverted_index = index_data.get("inverted_index", {})
+
+    q_tokens = tokenize(question)
+    if not chunks or not q_tokens:
         return []
 
+    candidate_ids = set()
+    for tok in q_tokens:
+        candidate_ids.update(inverted_index.get(tok, set()))
+
+    if not candidate_ids:
+        return []
+
+    chunk_map = {r["id"]: r for r in chunks}
     scored: List[Tuple[float, Dict[str, Any]]] = []
-    for r in records:
-        score = score_keyword_match(question, r.get("text", ""), r.get("source", ""))
+
+    for cid in candidate_ids:
+        record = chunk_map.get(cid)
+        if not record:
+            continue
+        score = score_keyword_match(question, record.get("text", ""), record.get("source", ""))
         if score > 0:
-            scored.append((score, r))
+            scored.append((score, record))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     docs: List[Document] = []
-    for score, r in scored[:k]:
+    for score, record in scored[:k]:
         docs.append(
             Document(
-                page_content=r.get("text", ""),
+                page_content=record["text"],
                 metadata={
-                    "id": r.get("id"),
-                    "source": r.get("source", "unknown"),
-                    "file_hash": r.get("file_hash"),
-                    "chunk": r.get("chunk", 0),
+                    "id": record["id"],
+                    "source": record["source"],
+                    "file_hash": record["file_hash"],
+                    "chunk": record["chunk"],
                     "retrieval": "keyword",
                     "keyword_score": round(score, 4),
                 },
@@ -1512,7 +1385,7 @@ def keyword_search(workspace_id: str, question: str, k: int = KEYWORD_K) -> List
 def semantic_search(workspace_id: str, question: str, k: int = SEMANTIC_K) -> List[Document]:
     vectordb = get_vectordb(workspace_id)
     try:
-        docs = vectordb.max_marginal_relevance_search(question, k=k, fetch_k=max(k * 3, 24))
+        docs = vectordb.max_marginal_relevance_search(question, k=k, fetch_k=max(k * 2, 20))
     except Exception:
         try:
             docs = vectordb.similarity_search(question, k=k)
@@ -1520,26 +1393,31 @@ def semantic_search(workspace_id: str, question: str, k: int = SEMANTIC_K) -> Li
             docs = []
 
     out: List[Document] = []
-    for rank, d in enumerate(docs):
-        md = dict(d.metadata or {})
+    for rank, doc in enumerate(docs):
+        md = dict(doc.metadata or {})
         md["retrieval"] = "semantic"
         md["semantic_score"] = max(0.0, float(k - rank))
-        out.append(Document(page_content=d.page_content, metadata=md))
+        out.append(Document(page_content=doc.page_content, metadata=md))
     return out
 
 
-def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], question: str, final_k: int = FINAL_K) -> List[Document]:
+def merge_results(
+    semantic_docs: List[Document],
+    keyword_docs: List[Document],
+    question: str,
+    final_k: int = FINAL_K,
+) -> List[Document]:
     by_id: Dict[str, Document] = {}
     combined_scores: Dict[str, float] = {}
     retrievals: Dict[str, set] = {}
 
-    for d in semantic_docs + keyword_docs:
-        md = dict(d.metadata or {})
+    for doc in semantic_docs + keyword_docs:
+        md = dict(doc.metadata or {})
         doc_id = str(md.get("id") or f"{md.get('source')}::{md.get('chunk')}")
         score = float(md.get("semantic_score", 0.0) or md.get("keyword_score", 0.0) or 0.0)
 
         if doc_id not in by_id:
-            by_id[doc_id] = d
+            by_id[doc_id] = doc
             combined_scores[doc_id] = score
             retrievals[doc_id] = {md.get("retrieval", "")}
         else:
@@ -1547,27 +1425,27 @@ def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], q
             retrievals[doc_id].add(md.get("retrieval", ""))
 
     merged: List[Document] = []
-    for doc_id, d in by_id.items():
-        md = dict(d.metadata or {})
+    for doc_id, doc in by_id.items():
+        md = dict(doc.metadata or {})
         md["retrievals"] = sorted(list(retrievals.get(doc_id, set())))
         md["combined_score"] = combined_scores.get(doc_id, 0.0)
         md["final_score"] = (
             float(md["combined_score"])
-            + score_keyword_match(question, d.page_content, md.get("source", ""))
+            + score_keyword_match(question, doc.page_content, md.get("source", ""))
             + (1.25 if len(md["retrievals"]) > 1 else 0.0)
         )
-        merged.append(Document(page_content=d.page_content, metadata=md))
+        merged.append(Document(page_content=doc.page_content, metadata=md))
 
     merged.sort(key=lambda d: float(d.metadata.get("final_score", 0.0)), reverse=True)
 
     final_docs: List[Document] = []
     seen = set()
-    for d in merged:
-        key = (d.metadata.get("source"), d.metadata.get("chunk"))
+    for doc in merged:
+        key = (doc.metadata.get("source"), doc.metadata.get("chunk"))
         if key in seen:
             continue
         seen.add(key)
-        final_docs.append(d)
+        final_docs.append(doc)
         if len(final_docs) >= final_k:
             break
 
@@ -1575,45 +1453,42 @@ def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], q
 
 
 def expand_adjacent_docs(workspace_id: str, docs: List[Document]) -> List[Document]:
-    manifest = load_manifest(workspace_id)
-    records = manifest.get("chunks", [])
-    if not records or not docs or ADJACENT_CHUNKS <= 0:
+    index_data = get_index_data(workspace_id)
+    chunk_lookup = index_data.get("chunk_lookup", {})
+    if not docs or ADJACENT_CHUNKS <= 0:
         return docs
-
-    chunk_lookup = {
-        (str(r.get("file_hash")), int(r.get("chunk", 0))): r for r in records
-    }
 
     expanded: List[Document] = []
     seen = set()
 
-    for d in docs:
-        md = dict(d.metadata or {})
+    for doc in docs:
+        md = dict(doc.metadata or {})
         key = (md.get("source"), md.get("chunk"))
         if key not in seen:
-            expanded.append(d)
+            expanded.append(doc)
             seen.add(key)
 
         file_hash = str(md.get("file_hash"))
         chunk_idx = int(md.get("chunk", 0))
+
         for offset in range(-ADJACENT_CHUNKS, ADJACENT_CHUNKS + 1):
             if offset == 0:
                 continue
             neighbor = chunk_lookup.get((file_hash, chunk_idx + offset))
             if not neighbor:
                 continue
-            nkey = (neighbor.get("source"), neighbor.get("chunk"))
+            nkey = (neighbor["source"], neighbor["chunk"])
             if nkey in seen:
                 continue
             seen.add(nkey)
             expanded.append(
                 Document(
-                    page_content=neighbor.get("text", ""),
+                    page_content=neighbor["text"],
                     metadata={
-                        "id": neighbor.get("id"),
-                        "source": neighbor.get("source", "unknown"),
-                        "file_hash": neighbor.get("file_hash"),
-                        "chunk": neighbor.get("chunk", 0),
+                        "id": neighbor["id"],
+                        "source": neighbor["source"],
+                        "file_hash": neighbor["file_hash"],
+                        "chunk": neighbor["chunk"],
                         "retrieval": "adjacent",
                         "retrievals": ["adjacent"],
                         "combined_score": 0.35,
@@ -1629,12 +1504,12 @@ def build_context(docs: List[Document], max_chars: int) -> str:
     parts: List[str] = []
     used = 0
 
-    for d in docs:
-        source = d.metadata.get("source", "unknown")
-        chunk = d.metadata.get("chunk", 0)
-        retrievals = d.metadata.get("retrievals")
-        retrieval = ",".join(retrievals) if retrievals else d.metadata.get("retrieval", "")
-        part = f"[source={source} chunk={chunk} retrieval={retrieval}] {d.page_content}"
+    for doc in docs:
+        source = doc.metadata.get("source", "unknown")
+        chunk = doc.metadata.get("chunk", 0)
+        retrievals = doc.metadata.get("retrievals")
+        retrieval = ",".join(retrievals) if retrievals else doc.metadata.get("retrieval", "")
+        part = f"[source={source} chunk={chunk} retrieval={retrieval}] {doc.page_content}"
         part_len = len(part)
 
         if used + part_len > max_chars:
@@ -1651,13 +1526,12 @@ def build_context(docs: List[Document], max_chars: int) -> str:
 
 def rag_answer(workspace_id: str, question: str) -> str:
     query_variants = rewrite_queries(question)
-
     all_semantic: List[Document] = []
     all_keyword: List[Document] = []
 
     for q in query_variants:
-        all_semantic.extend(semantic_search(workspace_id, q, k=SEMANTIC_K_PER_QUERY))
-        all_keyword.extend(keyword_search(workspace_id, q, k=KEYWORD_K_PER_QUERY))
+        all_semantic.extend(semantic_search(workspace_id, q, k=SEMANTIC_K))
+        all_keyword.extend(keyword_search(workspace_id, q, k=KEYWORD_K))
 
     docs = merge_results(all_semantic, all_keyword, question=question, final_k=FINAL_K)
     docs = expand_adjacent_docs(workspace_id, docs)
@@ -1679,7 +1553,6 @@ Answer using only the context above. If the answer is partially supported, provi
     raw = generate_streaming(prompt)
     obj = safe_json_load(raw)
     answer = (obj.get("answer") or "").strip()
-
     if not answer:
         answer = "I don't know based on the uploaded files."
 
@@ -1700,46 +1573,38 @@ Answer using only the context above. If the answer is partially supported, provi
 
 
 # ============================
-# STREAMLIT APP
+# MAIN APP
 # ============================
-def main():
+def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="centered")
     inject_styles()
-
-    ensure_dir(APP_DATA_ROOT)
-    ensure_dir(CHROMA_ROOT)
-    assert_writable_dir(APP_DATA_ROOT)
-    assert_writable_dir(CHROMA_ROOT)
-
-    janitor_sweep()
     login_gate()
+
     workspace_id = ensure_tenant_context()
 
-    if "messages" not in st.session_state:
+    if workspace_expired(workspace_id):
+        clear_workspace_storage(workspace_id)
         st.session_state.messages = []
-    if "indexed" not in st.session_state:
         st.session_state.indexed = False
-    if "failed_files" not in st.session_state:
         st.session_state.failed_files = []
-    if "processed_files" not in st.session_state:
         st.session_state.processed_files = []
-    if "created_at" not in st.session_state:
-        st.session_state.created_at = _now()
-    if "last_activity" not in st.session_state:
-        st.session_state.last_activity = _now()
-    if "last_debug_docs" not in st.session_state:
-        st.session_state.last_debug_docs = []
-    if "db_version" not in st.session_state:
-        st.session_state.db_version = utc_stamp()
+        st.session_state.last_index_count = 0
 
-    manifest = load_manifest(workspace_id)
-    if manifest.get("chunks"):
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("indexed", False)
+    st.session_state.setdefault("failed_files", [])
+    st.session_state.setdefault("processed_files", [])
+    st.session_state.setdefault("created_at", _now())
+    st.session_state.setdefault("last_activity", _now())
+    st.session_state.setdefault("last_debug_docs", [])
+    st.session_state.setdefault("last_index_count", 0)
+
+    index_data = get_index_data(workspace_id)
+    if index_data.get("chunks"):
         st.session_state.indexed = True
-        st.session_state.last_index_count = len(manifest.get("chunks", []))
+        st.session_state.last_index_count = len(index_data.get("chunks", []))
         if not st.session_state.get("processed_files"):
-            st.session_state.processed_files = [
-                f.get("file_name", "") for f in manifest.get("files", [])
-            ]
+            st.session_state.processed_files = [f.get("file_name", "") for f in index_data.get("files", [])]
 
     touch_activity(workspace_id)
 
@@ -1782,26 +1647,20 @@ def main():
             else:
                 try:
                     with st.spinner("Preparing your files..."):
-                        n = index_files(workspace_id, uploaded)
+                        count = index_files(workspace_id, uploaded)
                 except Exception as e:
-                    st.error(
-                        "Indexing failed due to a storage/database issue.\n\n"
-                        f"Details: {e}"
-                    )
+                    st.error(f"Indexing failed. Details: {e}")
                     return
 
-                if n == 0:
+                if count == 0:
                     st.warning(
                         "I couldn’t extract text from those files. Supported examples include PDF, DOC/DOCX, PPT/PPTX, ODT/ODS/ODP, TXT, CSV, XLS/XLSX/XLSB, Parquet, HTML, XML, YAML, JSON, JSONL, NDJSON, IPYNB, EML, MSG, RTF, RST, TEX, and code/text files."
                     )
                     if st.session_state.get("failed_files"):
-                        st.error(
-                            "Files that failed:\n\n"
-                            + "\n".join(f"- {x}" for x in st.session_state["failed_files"])
-                        )
+                        st.error("Files that failed:\n\n" + "\n".join(f"- {x}" for x in st.session_state["failed_files"]))
                 else:
                     st.success(
-                        f"Ready. Indexed {n} chunks from {len(st.session_state.get('processed_files', []))} file(s)."
+                        f"Ready. Indexed {count} chunks from {len(st.session_state.get('processed_files', []))} file(s)."
                     )
                     if st.session_state.get("failed_files"):
                         st.warning(
@@ -1847,20 +1706,18 @@ Questions or custom deployments: <strong>linkedin.com/in/thedannyscott</strong>
         with st.expander("Debug: last retrieved chunks"):
             st.json(st.session_state["last_debug_docs"])
 
-    for m in st.session_state.messages:
-        avatar = ASSISTANT_AVATAR if m["role"] == "assistant" else None
-        with st.chat_message(m["role"], avatar=avatar):
-            st.markdown(m["content"])
+    for message in st.session_state.messages:
+        avatar = ASSISTANT_AVATAR if message["role"] == "assistant" else None
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"])
 
     q = st.chat_input("Ask a question about your uploaded files…")
     if q:
         st.session_state.messages.append({"role": "user", "content": q})
-
         with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
             with st.spinner("Thinking..."):
                 answer = rag_answer(workspace_id, q)
             st.markdown(answer)
-
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
