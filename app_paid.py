@@ -1,4 +1,4 @@
-# app_paid.py
+# app_paid_DEV.py
 # DocHelp.AI — Upload → Index → Chat (LangChain + Chroma + AWS Bedrock)
 # Hybrid retrieval version:
 # - semantic search + keyword search across all uploaded chunks
@@ -24,6 +24,7 @@ from urllib.parse import unquote, quote
 from html.parser import HTMLParser
 from email import policy
 from email.parser import BytesParser
+from datetime import datetime
 import xml.etree.ElementTree as ET
 from collections import Counter
 
@@ -32,6 +33,7 @@ import streamlit as st
 # Load .env locally only (never override Streamlit Cloud secrets)
 try:
     from dotenv import load_dotenv
+
     if Path(".env").exists():
         load_dotenv(override=False)
 except Exception:
@@ -80,7 +82,16 @@ BEDROCK_EMBED_MODEL_ID = unquote(
     os.getenv("BEDROCK_EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0").strip()
 )
 
-CHROMA_ROOT = Path(os.getenv("CHROMA_ROOT", "/tmp/chroma_demo"))
+
+def default_app_data_root() -> Path:
+    env_root = os.getenv("DOCHELP_DATA_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    return (Path.home() / ".dochelp_ai").resolve()
+
+
+APP_DATA_ROOT = default_app_data_root()
+CHROMA_ROOT = APP_DATA_ROOT / "chroma"
 
 MAX_FILES = int(os.getenv("MAX_FILES", "300"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "500"))
@@ -92,15 +103,19 @@ SEMANTIC_K = int(os.getenv("SEMANTIC_K", "12"))
 KEYWORD_K = int(os.getenv("KEYWORD_K", "12"))
 FINAL_K = int(os.getenv("FINAL_K", "14"))
 
+SEMANTIC_K_PER_QUERY = int(os.getenv("SEMANTIC_K_PER_QUERY", str(SEMANTIC_K)))
+KEYWORD_K_PER_QUERY = int(os.getenv("KEYWORD_K_PER_QUERY", str(KEYWORD_K)))
+ADJACENT_CHUNKS = int(os.getenv("ADJACENT_CHUNKS", "1"))
+
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "25000"))
 
 WORKSPACE_TTL_SECONDS = int(os.getenv("WORKSPACE_TTL_SECONDS", "7200"))  # 2 hours
-IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))            # 30 minutes
+IDLE_TTL_SECONDS = int(os.getenv("IDLE_TTL_SECONDS", "1800"))  # 30 minutes
 JANITOR_MAX_DELETE = int(os.getenv("JANITOR_MAX_DELETE", "50"))
 META_FILENAME = "_meta.json"
-CHUNKS_FILENAME = "_chunks.json"
+MANIFEST_FILENAME = "_manifest.json"
 
 TENANT_SIGNING_KEY = os.getenv("TENANT_SIGNING_KEY", "").strip()
 
@@ -126,6 +141,18 @@ Return VALID JSON only in this format:
 {"answer":"..."}
 
 No markdown. No extra keys. No explanations.
+"""
+
+QUERY_REWRITE_PROMPT = """You rewrite user questions into search-friendly variants for document retrieval.
+
+Rules:
+- Stay faithful to the original meaning.
+- Produce 3 concise alternate queries.
+- Include likely key terms, synonyms, and document-oriented phrasing.
+- Do not add facts not present in the question.
+- If the question mentions a file name, preserve it.
+- Return valid JSON only:
+{"queries":["q1","q2","q3"]}
 """
 
 
@@ -262,16 +289,26 @@ def login_gate() -> None:
         return
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Private AI for Your Documents</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="center-note">Private AI for Your Documents</div>',
+        unsafe_allow_html=True,
+    )
 
     if not (APP_USERNAME and APP_PASSWORD):
-        st.error("Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud).")
+        st.error(
+            "Missing APP_USERNAME / APP_PASSWORD. Set them in .env (local) or Streamlit Secrets (cloud)."
+        )
         st.stop()
 
     st.markdown('<div class="gothic-sub">Login</div>', unsafe_allow_html=True)
 
     u = st.text_input("username", label_visibility="collapsed", placeholder="username")
-    p = st.text_input("password", type="password", label_visibility="collapsed", placeholder="password")
+    p = st.text_input(
+        "password",
+        type="password",
+        label_visibility="collapsed",
+        placeholder="password",
+    )
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -337,7 +374,10 @@ def get_query_params() -> Dict[str, str]:
         return {"t": qp.get("t", ""), "sig": qp.get("sig", "")}
     except Exception:
         qp = st.experimental_get_query_params()
-        return {"t": (qp.get("t", [""]) or [""])[0], "sig": (qp.get("sig", [""]) or [""])[0]}
+        return {
+            "t": (qp.get("t", [""]) or [""])[0],
+            "sig": (qp.get("sig", [""]) or [""])[0],
+        }
 
 
 def ensure_tenant_context() -> str:
@@ -390,6 +430,7 @@ def get_splitter() -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
     )
 
 
@@ -420,7 +461,15 @@ def _extract_text(obj: Any) -> str:
     if hasattr(obj, "content"):
         return _extract_text(obj.content)
     if isinstance(obj, list):
-        return "".join(x.get("text", "") for x in obj if isinstance(x, dict))
+        parts: List[str] = []
+        for x in obj:
+            if isinstance(x, dict):
+                parts.append(str(x.get("text", "")))
+            elif hasattr(x, "get"):
+                parts.append(str(x.get("text", "")))
+            else:
+                parts.append(str(x))
+        return "".join(parts)
     return ""
 
 
@@ -436,6 +485,48 @@ def generate_streaming(prompt: str) -> str:
     except Exception:
         resp = llm.invoke(prompt)
         return _extract_text(resp)
+
+
+def safe_json_load(s: str) -> Dict[str, Any]:
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    return {"answer": s.strip()}
+
+
+def rewrite_queries(question: str) -> List[str]:
+    prompt = f"""{QUERY_REWRITE_PROMPT}
+
+Original question:
+{question}
+"""
+    try:
+        raw = generate_streaming(prompt)
+        obj = safe_json_load(raw)
+        queries = obj.get("queries", [])
+        if isinstance(queries, list):
+            clean = []
+            for q in queries:
+                q = str(q or "").strip()
+                if q and q.lower() != question.lower():
+                    clean.append(q)
+            return dedupe_preserve_order([question] + clean[:3])
+    except Exception:
+        pass
+    return [question]
 
 
 # ============================
@@ -459,6 +550,15 @@ def _clean_whitespace(s: str) -> str:
     s = re.sub(r"\r\n?", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+
+def _decode_best_effort(file_bytes: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return file_bytes.decode(enc)
+        except Exception:
+            continue
+    return file_bytes.decode("utf-8", errors="ignore")
 
 
 def _strip_xml_tags(xml_text: str) -> str:
@@ -493,15 +593,26 @@ def _read_zip_member_text(file_bytes: bytes, member_names: List[str]) -> str:
 
 def read_pdf(file_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(file_bytes))
-    texts = []
-    for p in reader.pages:
-        texts.append(p.extract_text() or "")
-    return _clean_whitespace("\n".join(texts))
+    texts: List[str] = []
+    for i, p in enumerate(reader.pages):
+        try:
+            txt = p.extract_text() or ""
+        except Exception:
+            txt = ""
+        if txt.strip():
+            texts.append(f"[Page {i + 1}]\n{txt}")
+    return _clean_whitespace("\n\n".join(texts))
 
 
 def read_csv(file_bytes: bytes, sep: str = ",") -> str:
-    df = pd.read_csv(io.BytesIO(file_bytes), sep=sep)
-    return df.to_csv(index=False)
+    last_err = None
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, encoding=enc)
+            return df.to_csv(index=False)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Could not read CSV/TSV/PSV file: {last_err}")
 
 
 def read_excel(file_bytes: bytes, filename: str = "") -> str:
@@ -509,12 +620,11 @@ def read_excel(file_bytes: bytes, filename: str = "") -> str:
     bio = io.BytesIO(file_bytes)
     try:
         if name.endswith(".xlsx"):
-            df = pd.read_excel(bio, engine="openpyxl")
+            sheets = pd.read_excel(bio, engine="openpyxl", sheet_name=None)
         elif name.endswith(".xls"):
-            df = pd.read_excel(bio, engine="xlrd")
+            sheets = pd.read_excel(bio, engine="xlrd", sheet_name=None)
         else:
-            df = pd.read_excel(bio)
-        return df.to_csv(index=False)
+            sheets = pd.read_excel(bio, sheet_name=None)
     except ImportError as e:
         raise RuntimeError(
             f"Excel dependency missing for '{filename}'. Make sure openpyxl is installed for .xlsx and xlrd for .xls."
@@ -522,11 +632,30 @@ def read_excel(file_bytes: bytes, filename: str = "") -> str:
     except Exception as e:
         raise RuntimeError(f"Could not read Excel file '{filename}': {e}") from e
 
+    parts: List[str] = []
+    if isinstance(sheets, dict):
+        for sheet_name, df in sheets.items():
+            parts.append(f"=== Sheet: {sheet_name} ===")
+            try:
+                parts.append(df.fillna("").to_csv(index=False))
+            except Exception:
+                parts.append(str(df))
+            parts.append("")
+    else:
+        parts.append(str(sheets))
+    return _clean_whitespace("\n".join(parts))
+
 
 def read_xlsb(file_bytes: bytes, filename: str = "") -> str:
     try:
-        df = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb")
-        return df.to_csv(index=False)
+        sheets = pd.read_excel(io.BytesIO(file_bytes), engine="pyxlsb", sheet_name=None)
+        parts: List[str] = []
+        if isinstance(sheets, dict):
+            for sheet_name, df in sheets.items():
+                parts.append(f"=== Sheet: {sheet_name} ===")
+                parts.append(df.fillna("").to_csv(index=False))
+                parts.append("")
+        return _clean_whitespace("\n".join(parts))
     except ImportError as e:
         raise RuntimeError(
             f"Excel dependency missing for '{filename}'. Make sure pyxlsb is installed for .xlsb files."
@@ -538,21 +667,21 @@ def read_xlsb(file_bytes: bytes, filename: str = "") -> str:
 def read_parquet(file_bytes: bytes, filename: str = "") -> str:
     try:
         df = pd.read_parquet(io.BytesIO(file_bytes))
-        return df.to_csv(index=False)
+        return df.fillna("").to_csv(index=False)
     except Exception as e:
         raise RuntimeError(f"Could not read Parquet file '{filename}': {e}") from e
 
 
 def read_json(file_bytes: bytes) -> str:
     try:
-        obj = json.loads(file_bytes.decode("utf-8", errors="ignore"))
+        obj = json.loads(_decode_best_effort(file_bytes))
         return json.dumps(obj, ensure_ascii=False, indent=2)
     except Exception:
-        return file_bytes.decode("utf-8", errors="ignore").strip()
+        return _decode_best_effort(file_bytes).strip()
 
 
 def read_jsonl(file_bytes: bytes) -> str:
-    text = file_bytes.decode("utf-8", errors="ignore")
+    text = _decode_best_effort(file_bytes)
     rows: List[str] = []
     for line in text.splitlines():
         line = line.strip()
@@ -567,15 +696,16 @@ def read_jsonl(file_bytes: bytes) -> str:
 
 
 def read_yaml(file_bytes: bytes) -> str:
+    text = _decode_best_effort(file_bytes)
     try:
-        obj = yaml.safe_load(file_bytes.decode("utf-8", errors="ignore"))
+        obj = yaml.safe_load(text)
         return yaml.safe_dump(obj, sort_keys=False, allow_unicode=True)
     except Exception:
-        return file_bytes.decode("utf-8", errors="ignore").strip()
+        return text.strip()
 
 
 def read_ini(file_bytes: bytes) -> str:
-    raw = file_bytes.decode("utf-8", errors="ignore")
+    raw = _decode_best_effort(file_bytes)
     cp = configparser.ConfigParser()
     try:
         cp.read_string(raw)
@@ -601,12 +731,12 @@ def read_xml(file_bytes: bytes) -> str:
                 parts.append(elem.tail.strip())
         return _clean_whitespace("\n".join(parts))
     except Exception:
-        xml = file_bytes.decode("utf-8", errors="ignore")
+        xml = _decode_best_effort(file_bytes)
         return _clean_whitespace(re.sub(r"<[^>]+>", " ", xml))
 
 
 def read_html(file_bytes: bytes) -> str:
-    html = file_bytes.decode("utf-8", errors="ignore")
+    html = _decode_best_effort(file_bytes)
     parser = _HTMLTextExtractor()
     try:
         parser.feed(html)
@@ -624,11 +754,16 @@ def read_docx(file_bytes: bytes) -> str:
 def read_pptx(file_bytes: bytes) -> str:
     pres = Presentation(io.BytesIO(file_bytes))
     parts: List[str] = []
-    for slide in pres.slides:
+    for slide_idx, slide in enumerate(pres.slides, start=1):
+        slide_parts: List[str] = []
         for shape in slide.shapes:
             txt = getattr(shape, "text", None)
             if txt and str(txt).strip():
-                parts.append(str(txt).strip())
+                slide_parts.append(str(txt).strip())
+        if slide_parts:
+            parts.append(f"[Slide {slide_idx}]")
+            parts.extend(slide_parts)
+            parts.append("")
     return _clean_whitespace("\n".join(parts))
 
 
@@ -750,7 +885,7 @@ def read_msg(file_bytes: bytes) -> str:
 
 def read_ipynb(file_bytes: bytes) -> str:
     try:
-        nb = json.loads(file_bytes.decode("utf-8", errors="ignore"))
+        nb = json.loads(_decode_best_effort(file_bytes))
         cells = nb.get("cells", []) if isinstance(nb, dict) else []
         parts: List[str] = []
         for c in cells:
@@ -763,7 +898,7 @@ def read_ipynb(file_bytes: bytes) -> str:
                 parts.append(s.strip())
         return _clean_whitespace("\n\n".join(parts))
     except Exception:
-        return file_bytes.decode("utf-8", errors="ignore").strip()
+        return _decode_best_effort(file_bytes).strip()
 
 
 def read_eml(file_bytes: bytes) -> str:
@@ -795,7 +930,7 @@ def read_eml(file_bytes: bytes) -> str:
                         content = part.get_payload(decode=True)
                         content = (content or b"").decode("utf-8", errors="ignore")
                     if ctype == "text/html":
-                        content = read_html(content.encode("utf-8", errors="ignore"))
+                        content = read_html(str(content).encode("utf-8", errors="ignore"))
                     if content and str(content).strip():
                         body_texts.append(str(content).strip())
         else:
@@ -811,11 +946,11 @@ def read_eml(file_bytes: bytes) -> str:
 
         return _clean_whitespace("\n".join(parts))
     except Exception:
-        return file_bytes.decode("utf-8", errors="ignore").strip()
+        return _decode_best_effort(file_bytes).strip()
 
 
 def read_rtf(file_bytes: bytes) -> str:
-    raw = file_bytes.decode("utf-8", errors="ignore")
+    raw = _decode_best_effort(file_bytes)
     if _rtf_to_text is not None:
         try:
             return _clean_whitespace(_rtf_to_text(raw))
@@ -826,7 +961,7 @@ def read_rtf(file_bytes: bytes) -> str:
 
 
 def read_txt(file_bytes: bytes) -> str:
-    return _clean_whitespace(file_bytes.decode("utf-8", errors="ignore"))
+    return _clean_whitespace(_decode_best_effort(file_bytes))
 
 
 CODE_EXTS = (
@@ -935,6 +1070,37 @@ def _now() -> int:
     return int(time.time())
 
 
+def utc_stamp() -> str:
+    return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def assert_writable_dir(path: Path) -> None:
+    ensure_dir(path)
+    test_file = path / f".write_test_{uuid.uuid4().hex}.tmp"
+    try:
+        test_file.write_text("ok", encoding="utf-8")
+        _ = test_file.read_text(encoding="utf-8")
+    finally:
+        try:
+            if test_file.exists():
+                test_file.unlink()
+        except Exception:
+            pass
+
+
+def safe_rmtree(path: Path) -> None:
+    try:
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def read_workspace_meta(d: Path) -> Dict[str, Any]:
     p = d / META_FILENAME
     try:
@@ -944,12 +1110,45 @@ def read_workspace_meta(d: Path) -> Dict[str, Any]:
 
 
 def write_workspace_meta(d: Path, created_at: int, last_activity: int) -> None:
+    ensure_dir(d)
     p = d / META_FILENAME
     meta = {"created_at": int(created_at), "last_activity": int(last_activity)}
     try:
         p.write_text(json.dumps(meta), encoding="utf-8")
     except Exception:
         pass
+
+
+def get_workspace_db_version() -> str:
+    version = st.session_state.get("db_version")
+    if not version:
+        version = utc_stamp()
+        st.session_state["db_version"] = version
+    return version
+
+
+def bump_workspace_db_version() -> str:
+    version = utc_stamp()
+    st.session_state["db_version"] = version
+    return version
+
+
+def workspace_base_dir(workspace_id: str) -> Path:
+    return ensure_dir(CHROMA_ROOT / workspace_id)
+
+
+def workspace_meta_dir(workspace_id: str) -> Path:
+    d = workspace_base_dir(workspace_id) / "meta"
+    ensure_dir(d)
+    assert_writable_dir(d)
+    return d
+
+
+def workspace_db_dir(workspace_id: str) -> Path:
+    d = workspace_base_dir(workspace_id) / f"db_{get_workspace_db_version()}"
+    ensure_dir(d)
+    assert_writable_dir(d)
+    return d
 
 
 def janitor_sweep() -> int:
@@ -959,14 +1158,15 @@ def janitor_sweep() -> int:
     now = _now()
     deleted = 0
 
-    for d in CHROMA_ROOT.iterdir():
-        if not d.is_dir():
+    for ws_dir in CHROMA_ROOT.iterdir():
+        if not ws_dir.is_dir():
             continue
 
-        meta = read_workspace_meta(d)
+        meta_dir = ws_dir / "meta"
+        meta = read_workspace_meta(meta_dir) if meta_dir.exists() else {}
         created_at = int(meta.get("created_at") or 0)
         last_activity = int(meta.get("last_activity") or 0)
-        mtime = int(d.stat().st_mtime)
+        mtime = int(ws_dir.stat().st_mtime)
 
         if created_at <= 0:
             created_at = mtime
@@ -974,11 +1174,8 @@ def janitor_sweep() -> int:
             last_activity = mtime
 
         if (now - created_at) > WORKSPACE_TTL_SECONDS or (now - last_activity) > IDLE_TTL_SECONDS:
-            try:
-                shutil.rmtree(d)
-                deleted += 1
-            except Exception:
-                pass
+            safe_rmtree(ws_dir)
+            deleted += 1
 
         if deleted >= JANITOR_MAX_DELETE:
             break
@@ -993,72 +1190,90 @@ def touch_activity(workspace_id: str) -> None:
         st.session_state.created_at = now
 
     st.session_state.last_activity = now
-
-    d = CHROMA_ROOT / workspace_id
-    if d.exists():
-        write_workspace_meta(d, st.session_state.created_at, st.session_state.last_activity)
+    write_workspace_meta(
+        workspace_meta_dir(workspace_id),
+        st.session_state.created_at,
+        st.session_state.last_activity,
+    )
 
 
 # ============================
 # VECTOR STORE + LOCAL CHUNK CATALOG
 # ============================
 def workspace_dir(workspace_id: str) -> Path:
-    d = CHROMA_ROOT / workspace_id
-    d.mkdir(parents=True, exist_ok=True)
-
+    d = workspace_meta_dir(workspace_id)
     created_at = int(st.session_state.get("created_at") or _now())
     last_activity = int(st.session_state.get("last_activity") or _now())
     write_workspace_meta(d, created_at, last_activity)
-
     return d
 
 
-def chunks_catalog_path(workspace_id: str) -> Path:
-    return workspace_dir(workspace_id) / CHUNKS_FILENAME
+def manifest_path(workspace_id: str) -> Path:
+    return workspace_meta_dir(workspace_id) / MANIFEST_FILENAME
 
 
-def save_chunks_catalog(workspace_id: str, records: List[Dict[str, Any]]) -> None:
-    p = chunks_catalog_path(workspace_id)
+def save_manifest(workspace_id: str, manifest: Dict[str, Any]) -> None:
+    p = manifest_path(workspace_id)
+    ensure_dir(p.parent)
+    assert_writable_dir(p.parent)
+    p.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+
+def load_manifest(workspace_id: str) -> Dict[str, Any]:
+    p = manifest_path(workspace_id)
     try:
-        p.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("files", [])
+            data.setdefault("chunks", [])
+            return data
     except Exception:
         pass
-
-
-def load_chunks_catalog(workspace_id: str) -> List[Dict[str, Any]]:
-    p = chunks_catalog_path(workspace_id)
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return []
+    return {"files": [], "chunks": []}
 
 
 def clear_workspace_storage(workspace_id: str) -> None:
-    d = CHROMA_ROOT / workspace_id
-    if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-    d.mkdir(parents=True, exist_ok=True)
-    write_workspace_meta(d, int(st.session_state.get("created_at") or _now()), int(st.session_state.get("last_activity") or _now()))
+    bump_workspace_db_version()
+    write_workspace_meta(
+        workspace_meta_dir(workspace_id),
+        int(st.session_state.get("created_at") or _now()),
+        int(st.session_state.get("last_activity") or _now()),
+    )
+    save_manifest(workspace_id, {"files": [], "chunks": []})
 
 
 def get_vectordb(workspace_id: str) -> Chroma:
-    d = workspace_dir(workspace_id)
-    collection = f"demo_docs_{workspace_id[:12]}"
+    db_dir = workspace_db_dir(workspace_id)
+    collection = f"demo_docs_{workspace_id[:12]}_{get_workspace_db_version()[:12]}"
     return Chroma(
         collection_name=collection,
-        persist_directory=str(d),
+        persist_directory=str(db_dir),
         embedding_function=get_embeddings(),
     )
 
 
-def reset_workspace() -> None:
-    old_ws = st.session_state.get("workspace_id")
-    if old_ws:
-        try:
-            shutil.rmtree(CHROMA_ROOT / old_ws, ignore_errors=True)
-        except Exception:
-            pass
+def add_documents_with_retry(workspace_id: str, docs: List[Document], ids: List[str]) -> None:
+    if not docs:
+        return
 
+    last_error = None
+    for attempt in range(2):
+        try:
+            vectordb = get_vectordb(workspace_id)
+            vectordb.add_documents(docs, ids=ids)
+            return
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                bump_workspace_db_version()
+                continue
+
+    raise RuntimeError(
+        f"Chroma write failed after retry. Current db dir: {workspace_db_dir(workspace_id)}. Error: {last_error}"
+    ) from last_error
+
+
+def reset_workspace() -> None:
     t = uuid.uuid4().hex
     sig = sign_token(t)
     set_query_params(t, sig)
@@ -1070,56 +1285,87 @@ def reset_workspace() -> None:
     st.session_state.processed_files = []
     st.session_state.created_at = _now()
     st.session_state.last_activity = _now()
+    st.session_state.last_debug_docs = []
+    st.session_state.db_version = utc_stamp()
 
 
 # ============================
 # INDEXING
 # ============================
-def _normalize_text_for_search(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in", "on", "for",
     "with", "by", "from", "at", "as", "is", "are", "was", "were", "be", "been", "being",
     "this", "that", "these", "those", "it", "its", "their", "there", "here", "what",
     "which", "who", "whom", "how", "when", "where", "why", "can", "could", "should",
-    "would", "do", "does", "did", "about", "into", "than", "them", "they", "you", "your"
+    "would", "do", "does", "did", "about", "into", "than", "them", "they", "you", "your",
+    "me", "my", "we", "our", "please", "show", "tell", "give"
 }
+
+
+def _normalize_text_for_search(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s._/-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def tokenize(s: str) -> List[str]:
     s = _normalize_text_for_search(s)
-    toks = [t for t in s.split() if t and t not in STOPWORDS and len(t) > 1]
-    return toks
+    return [t for t in s.split() if t and t not in STOPWORDS and len(t) > 1]
 
 
-def build_chunk_record(source: str, chunk_index: int, text: str) -> Dict[str, Any]:
-    return {
-        "id": f"{source}__{chunk_index}",
-        "source": source,
-        "chunk": chunk_index,
-        "text": text,
-        "norm_text": _normalize_text_for_search(text),
-    }
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def file_hash_bytes(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def build_chunk_id(file_hash: str, chunk_idx: int) -> str:
+    return f"{file_hash}::{chunk_idx}"
+
+
+def get_existing_file_hashes(manifest: Dict[str, Any]) -> set:
+    return {str(f.get("file_hash")) for f in manifest.get("files", []) if f.get("file_hash")}
 
 
 def index_files(workspace_id: str, files) -> int:
     clear_workspace_storage(workspace_id)
-    vectordb = get_vectordb(workspace_id)
-    docs: List[Document] = []
-    chunk_records: List[Dict[str, Any]] = []
-    splitter = get_splitter()
 
+    assert_writable_dir(APP_DATA_ROOT)
+    assert_writable_dir(CHROMA_ROOT)
+    assert_writable_dir(workspace_base_dir(workspace_id))
+    assert_writable_dir(workspace_meta_dir(workspace_id))
+    assert_writable_dir(workspace_db_dir(workspace_id))
+
+    splitter = get_splitter()
+    manifest = load_manifest(workspace_id)
+    docs: List[Document] = []
+    ids: List[str] = []
     failed_files: List[str] = []
     processed_files: List[str] = []
+    existing_hashes = get_existing_file_hashes(manifest)
 
     total_chunks = 0
 
     for f in files:
+        try:
+            raw_bytes = f.getvalue()
+            f_hash = file_hash_bytes(raw_bytes)
+        except Exception as e:
+            failed_files.append(f"{f.name}: could not read uploaded bytes: {e}")
+            continue
+
+        if f_hash in existing_hashes:
+            continue
+
         try:
             text = file_to_text(f)
         except Exception as e:
@@ -1130,62 +1376,81 @@ def index_files(workspace_id: str, files) -> int:
             failed_files.append(f"{f.name}: no extractable text found")
             continue
 
-        processed_files.append(f.name)
-
         try:
             chunks = splitter.split_text(text)
         except Exception as e:
             failed_files.append(f"{f.name}: chunking failed: {e}")
             continue
 
-        local_chunk_idx = 0
-        for chunk in chunks:
-            chunk = (chunk or "").strip()
-            if not chunk:
-                continue
+        clean_chunks = [(chunk or "").strip() for chunk in chunks if (chunk or "").strip()]
+        if not clean_chunks:
+            failed_files.append(f"{f.name}: no usable chunks after parsing")
+            continue
 
-            docs.append(
-                Document(
-                    page_content=chunk,
-                    metadata={"source": f.name, "chunk": local_chunk_idx},
-                )
-            )
-
-            chunk_records.append(build_chunk_record(f.name, local_chunk_idx, chunk))
-            local_chunk_idx += 1
-            total_chunks += 1
-
-            if total_chunks >= MAX_TOTAL_CHUNKS:
-                break
-
-        if total_chunks >= MAX_TOTAL_CHUNKS:
+        if total_chunks + len(clean_chunks) > MAX_TOTAL_CHUNKS:
             failed_files.append("Chunk limit reached; some later file content may not have been indexed.")
             break
 
+        manifest["files"].append(
+            {
+                "file_name": f.name,
+                "file_hash": f_hash,
+                "size_bytes": int(getattr(f, "size", 0) or 0),
+                "chunk_count": len(clean_chunks),
+                "indexed_at": _now(),
+            }
+        )
+
+        for idx, chunk in enumerate(clean_chunks):
+            chunk_id = build_chunk_id(f_hash, idx)
+            manifest["chunks"].append(
+                {
+                    "id": chunk_id,
+                    "source": f.name,
+                    "file_hash": f_hash,
+                    "chunk": idx,
+                    "text": chunk,
+                    "norm_text": _normalize_text_for_search(chunk),
+                }
+            )
+            docs.append(
+                Document(
+                    page_content=chunk,
+                    metadata={"id": chunk_id, "source": f.name, "file_hash": f_hash, "chunk": idx},
+                )
+            )
+            ids.append(chunk_id)
+            total_chunks += 1
+
+        processed_files.append(f.name)
+        existing_hashes.add(f_hash)
+
     if docs:
-        vectordb.add_documents(docs)
+        add_documents_with_retry(workspace_id, docs, ids)
 
-    save_chunks_catalog(workspace_id, chunk_records)
+    save_manifest(workspace_id, manifest)
 
-    st.session_state.indexed = True
-    st.session_state.last_index_count = len(docs)
-    st.session_state.failed_files = failed_files
-    st.session_state.processed_files = processed_files
+    st.session_state.indexed = len(manifest.get("chunks", [])) > 0
+    st.session_state.last_index_count = len(manifest.get("chunks", []))
+    st.session_state.failed_files = dedupe_preserve_order(failed_files)
+    st.session_state.processed_files = dedupe_preserve_order(processed_files)
     touch_activity(workspace_id)
-    return len(docs)
+    return len(manifest.get("chunks", []))
 
 
 # ============================
 # RETRIEVAL
 # ============================
-def score_keyword_match(question: str, chunk_text: str) -> float:
+def score_keyword_match(question: str, chunk_text: str, filename: str = "") -> float:
     q_tokens = tokenize(question)
     if not q_tokens:
         return 0.0
 
     text_norm = _normalize_text_for_search(chunk_text)
+    file_norm = _normalize_text_for_search(filename)
     text_tokens = text_norm.split()
-    if not text_tokens:
+
+    if not text_tokens and not file_norm:
         return 0.0
 
     q_counter = Counter(q_tokens)
@@ -1201,22 +1466,26 @@ def score_keyword_match(question: str, chunk_text: str) -> float:
         phrase_bonus += 5.0
 
     exact_token_bonus = 0.0
+    filename_bonus = 0.0
     for tok in set(q_tokens):
         if tok in text_norm:
             exact_token_bonus += 0.25
+        if tok in file_norm:
+            filename_bonus += 0.80
 
     density = overlap / max(1.0, len(q_tokens))
-    return float(density * 10.0 + phrase_bonus + exact_token_bonus)
+    return float(density * 10.0 + phrase_bonus + exact_token_bonus + filename_bonus)
 
 
 def keyword_search(workspace_id: str, question: str, k: int = KEYWORD_K) -> List[Document]:
-    records = load_chunks_catalog(workspace_id)
+    manifest = load_manifest(workspace_id)
+    records = manifest.get("chunks", [])
     if not records:
         return []
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for r in records:
-        score = score_keyword_match(question, r.get("text", ""))
+        score = score_keyword_match(question, r.get("text", ""), r.get("source", ""))
         if score > 0:
             scored.append((score, r))
 
@@ -1228,7 +1497,9 @@ def keyword_search(workspace_id: str, question: str, k: int = KEYWORD_K) -> List
             Document(
                 page_content=r.get("text", ""),
                 metadata={
+                    "id": r.get("id"),
                     "source": r.get("source", "unknown"),
+                    "file_hash": r.get("file_hash"),
                     "chunk": r.get("chunk", 0),
                     "retrieval": "keyword",
                     "keyword_score": round(score, 4),
@@ -1243,41 +1514,115 @@ def semantic_search(workspace_id: str, question: str, k: int = SEMANTIC_K) -> Li
     try:
         docs = vectordb.max_marginal_relevance_search(question, k=k, fetch_k=max(k * 3, 24))
     except Exception:
-        docs = vectordb.similarity_search(question, k=k)
+        try:
+            docs = vectordb.similarity_search(question, k=k)
+        except Exception:
+            docs = []
 
     out: List[Document] = []
-    for d in docs:
+    for rank, d in enumerate(docs):
         md = dict(d.metadata or {})
         md["retrieval"] = "semantic"
+        md["semantic_score"] = max(0.0, float(k - rank))
         out.append(Document(page_content=d.page_content, metadata=md))
     return out
 
 
-def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], final_k: int = FINAL_K) -> List[Document]:
+def merge_results(semantic_docs: List[Document], keyword_docs: List[Document], question: str, final_k: int = FINAL_K) -> List[Document]:
+    by_id: Dict[str, Document] = {}
+    combined_scores: Dict[str, float] = {}
+    retrievals: Dict[str, set] = {}
+
+    for d in semantic_docs + keyword_docs:
+        md = dict(d.metadata or {})
+        doc_id = str(md.get("id") or f"{md.get('source')}::{md.get('chunk')}")
+        score = float(md.get("semantic_score", 0.0) or md.get("keyword_score", 0.0) or 0.0)
+
+        if doc_id not in by_id:
+            by_id[doc_id] = d
+            combined_scores[doc_id] = score
+            retrievals[doc_id] = {md.get("retrieval", "")}
+        else:
+            combined_scores[doc_id] += score
+            retrievals[doc_id].add(md.get("retrieval", ""))
+
     merged: List[Document] = []
+    for doc_id, d in by_id.items():
+        md = dict(d.metadata or {})
+        md["retrievals"] = sorted(list(retrievals.get(doc_id, set())))
+        md["combined_score"] = combined_scores.get(doc_id, 0.0)
+        md["final_score"] = (
+            float(md["combined_score"])
+            + score_keyword_match(question, d.page_content, md.get("source", ""))
+            + (1.25 if len(md["retrievals"]) > 1 else 0.0)
+        )
+        merged.append(Document(page_content=d.page_content, metadata=md))
+
+    merged.sort(key=lambda d: float(d.metadata.get("final_score", 0.0)), reverse=True)
+
+    final_docs: List[Document] = []
     seen = set()
-
-    # interleave strong semantic and keyword results
-    max_len = max(len(semantic_docs), len(keyword_docs))
-    for i in range(max_len):
-        if i < len(semantic_docs):
-            d = semantic_docs[i]
-            key = (d.metadata.get("source"), d.metadata.get("chunk"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(d)
-
-        if i < len(keyword_docs):
-            d = keyword_docs[i]
-            key = (d.metadata.get("source"), d.metadata.get("chunk"))
-            if key not in seen:
-                seen.add(key)
-                merged.append(d)
-
-        if len(merged) >= final_k:
+    for d in merged:
+        key = (d.metadata.get("source"), d.metadata.get("chunk"))
+        if key in seen:
+            continue
+        seen.add(key)
+        final_docs.append(d)
+        if len(final_docs) >= final_k:
             break
 
-    return merged[:final_k]
+    return final_docs
+
+
+def expand_adjacent_docs(workspace_id: str, docs: List[Document]) -> List[Document]:
+    manifest = load_manifest(workspace_id)
+    records = manifest.get("chunks", [])
+    if not records or not docs or ADJACENT_CHUNKS <= 0:
+        return docs
+
+    chunk_lookup = {
+        (str(r.get("file_hash")), int(r.get("chunk", 0))): r for r in records
+    }
+
+    expanded: List[Document] = []
+    seen = set()
+
+    for d in docs:
+        md = dict(d.metadata or {})
+        key = (md.get("source"), md.get("chunk"))
+        if key not in seen:
+            expanded.append(d)
+            seen.add(key)
+
+        file_hash = str(md.get("file_hash"))
+        chunk_idx = int(md.get("chunk", 0))
+        for offset in range(-ADJACENT_CHUNKS, ADJACENT_CHUNKS + 1):
+            if offset == 0:
+                continue
+            neighbor = chunk_lookup.get((file_hash, chunk_idx + offset))
+            if not neighbor:
+                continue
+            nkey = (neighbor.get("source"), neighbor.get("chunk"))
+            if nkey in seen:
+                continue
+            seen.add(nkey)
+            expanded.append(
+                Document(
+                    page_content=neighbor.get("text", ""),
+                    metadata={
+                        "id": neighbor.get("id"),
+                        "source": neighbor.get("source", "unknown"),
+                        "file_hash": neighbor.get("file_hash"),
+                        "chunk": neighbor.get("chunk", 0),
+                        "retrieval": "adjacent",
+                        "retrievals": ["adjacent"],
+                        "combined_score": 0.35,
+                        "final_score": 0.35,
+                    },
+                )
+            )
+
+    return expanded[: max(FINAL_K * 2, 24)]
 
 
 def build_context(docs: List[Document], max_chars: int) -> str:
@@ -1287,7 +1632,8 @@ def build_context(docs: List[Document], max_chars: int) -> str:
     for d in docs:
         source = d.metadata.get("source", "unknown")
         chunk = d.metadata.get("chunk", 0)
-        retrieval = d.metadata.get("retrieval", "")
+        retrievals = d.metadata.get("retrievals")
+        retrieval = ",".join(retrievals) if retrievals else d.metadata.get("retrieval", "")
         part = f"[source={source} chunk={chunk} retrieval={retrieval}] {d.page_content}"
         part_len = len(part)
 
@@ -1303,22 +1649,22 @@ def build_context(docs: List[Document], max_chars: int) -> str:
     return "\n\n".join(parts)
 
 
-def safe_json_load(s: str) -> Dict[str, Any]:
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    return {"answer": s.strip()}
-
-
 def rag_answer(workspace_id: str, question: str) -> str:
-    semantic_docs = semantic_search(workspace_id, question, k=SEMANTIC_K)
-    keyword_docs = keyword_search(workspace_id, question, k=KEYWORD_K)
-    docs = merge_results(semantic_docs, keyword_docs, final_k=FINAL_K)
+    query_variants = rewrite_queries(question)
 
+    all_semantic: List[Document] = []
+    all_keyword: List[Document] = []
+
+    for q in query_variants:
+        all_semantic.extend(semantic_search(workspace_id, q, k=SEMANTIC_K_PER_QUERY))
+        all_keyword.extend(keyword_search(workspace_id, q, k=KEYWORD_K_PER_QUERY))
+
+    docs = merge_results(all_semantic, all_keyword, question=question, final_k=FINAL_K)
+    docs = expand_adjacent_docs(workspace_id, docs)
     context = build_context(docs, MAX_CONTEXT_CHARS)
+
+    if not context.strip():
+        return "I don't know based on the uploaded files."
 
     prompt = f"""{SYSTEM_PROMPT}
 
@@ -1343,6 +1689,7 @@ Answer using only the context above. If the answer is partially supported, provi
                 "source": d.metadata.get("source"),
                 "chunk": d.metadata.get("chunk"),
                 "retrieval": d.metadata.get("retrieval"),
+                "retrievals": d.metadata.get("retrievals", []),
                 "preview": d.page_content[:400],
             }
             for d in docs
@@ -1357,9 +1704,14 @@ Answer using only the context above. If the answer is partially supported, provi
 # ============================
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="centered")
-    janitor_sweep()
     inject_styles()
 
+    ensure_dir(APP_DATA_ROOT)
+    ensure_dir(CHROMA_ROOT)
+    assert_writable_dir(APP_DATA_ROOT)
+    assert_writable_dir(CHROMA_ROOT)
+
+    janitor_sweep()
     login_gate()
     workspace_id = ensure_tenant_context()
 
@@ -1377,11 +1729,25 @@ def main():
         st.session_state.last_activity = _now()
     if "last_debug_docs" not in st.session_state:
         st.session_state.last_debug_docs = []
+    if "db_version" not in st.session_state:
+        st.session_state.db_version = utc_stamp()
+
+    manifest = load_manifest(workspace_id)
+    if manifest.get("chunks"):
+        st.session_state.indexed = True
+        st.session_state.last_index_count = len(manifest.get("chunks", []))
+        if not st.session_state.get("processed_files"):
+            st.session_state.processed_files = [
+                f.get("file_name", "") for f in manifest.get("files", [])
+            ]
 
     touch_activity(workspace_id)
 
     st.markdown(f'<div class="gothic-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="center-note">Ask Questions About Your Documents</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="center-note">Ask Questions About Your Documents</div>',
+        unsafe_allow_html=True,
+    )
 
     if not st.session_state.indexed:
         st.markdown(
@@ -1414,19 +1780,34 @@ def main():
             if not ok:
                 st.error(msg)
             else:
-                with st.spinner("Preparing your files..."):
-                    n = index_files(workspace_id, uploaded)
+                try:
+                    with st.spinner("Preparing your files..."):
+                        n = index_files(workspace_id, uploaded)
+                except Exception as e:
+                    st.error(
+                        "Indexing failed due to a storage/database issue.\n\n"
+                        f"Details: {e}"
+                    )
+                    return
 
                 if n == 0:
                     st.warning(
                         "I couldn’t extract text from those files. Supported examples include PDF, DOC/DOCX, PPT/PPTX, ODT/ODS/ODP, TXT, CSV, XLS/XLSX/XLSB, Parquet, HTML, XML, YAML, JSON, JSONL, NDJSON, IPYNB, EML, MSG, RTF, RST, TEX, and code/text files."
                     )
                     if st.session_state.get("failed_files"):
-                        st.error("Files that failed:\n\n" + "\n".join(f"- {x}" for x in st.session_state["failed_files"]))
+                        st.error(
+                            "Files that failed:\n\n"
+                            + "\n".join(f"- {x}" for x in st.session_state["failed_files"])
+                        )
                 else:
-                    st.success(f"Ready. Indexed {n} chunks from {len(st.session_state.get('processed_files', []))} file(s).")
+                    st.success(
+                        f"Ready. Indexed {n} chunks from {len(st.session_state.get('processed_files', []))} file(s)."
+                    )
                     if st.session_state.get("failed_files"):
-                        st.warning("Some files could not be processed:\n\n" + "\n".join(f"- {x}" for x in st.session_state["failed_files"]))
+                        st.warning(
+                            "Some files could not be processed:\n\n"
+                            + "\n".join(f"- {x}" for x in st.session_state["failed_files"])
+                        )
                     st.rerun()
 
         st.markdown(
